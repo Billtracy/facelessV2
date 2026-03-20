@@ -1,0 +1,11 @@
+{
+    "groq_api_key": "",
+    "pexels_api_key": "",
+    "output_folder": "output",
+    "last_topic": "",
+    "last_mood": "Darkness",
+    "last_voice": "en-US-ChristopherNeural",
+    "last_font": "Arial-Bold",
+    "prompt_template": "",
+    "license_key": ""
+}
