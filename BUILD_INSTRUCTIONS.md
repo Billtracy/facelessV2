@@ -85,18 +85,26 @@ If you have `app_icon.png`:
 
 ### Step 3: Run the Build Command
 
-**Copy and paste this EXACT command:**
+**PREFERRED METHOD — Use the .spec file:**
 
 ```bash
-pyinstaller --noconfirm --onedir --windowed --name "FacelessGenerator" --add-data "settings_template.json:." --collect-all customtkinter --collect-all groq --collect-all edge_tts --collect-all movis --collect-all kokoro_onnx --copy-metadata imageio --copy-metadata requests --copy-metadata packaging --hidden-import "pydub" --hidden-import "requests" --hidden-import "PIL" --hidden-import "PIL.ImageDraw" --hidden-import "PIL.ImageFont" --hidden-import "numpy" --hidden-import "soundfile" --hidden-import "tkinter" --hidden-import "tkinter.ttk" --hidden-import "tkinter.font" --icon "icon.ico" main.py
+pyinstaller FacelessGenerator.spec --noconfirm
+```
+
+**OR copy and paste this command (equivalent):**
+
+```bash
+pyinstaller --noconfirm --onedir --windowed --name "FacelessGenerator" --add-data "settings_template.json;." --add-data "assets;assets" --collect-all customtkinter --collect-all groq --collect-all edge_tts --collect-all movis --collect-all kokoro_onnx --copy-metadata imageio --copy-metadata requests --copy-metadata packaging --hidden-import "pydub" --hidden-import "requests" --hidden-import "PIL" --hidden-import "PIL.ImageDraw" --hidden-import "PIL.ImageFont" --hidden-import "numpy" --hidden-import "soundfile" --hidden-import "tkinter" --hidden-import "tkinter.ttk" --hidden-import "tkinter.font" --hidden-import "google.genai" --icon "icon.ico" main.py
 ```
 
 **If you don't have `icon.ico`, remove** `--icon "icon.ico"` from the command.
 
 **What's new:**
-- `--collect-all movis` - **CRITICAL:** Required for the new video rendering engine.
+- `--add-data "assets;assets"` - **CRITICAL:** Bundles fonts, SFX, and background music.
+- `--collect-all movis` - Required for the video rendering engine.
 - `--collect-all kokoro_onnx` - Required for the premium local TTS engine.
 - `--hidden-import "soundfile"` - Required for processing audio samples.
+- `--hidden-import "google.genai"` - Required for Gemini AI provider.
 - `--copy-metadata packaging` - Fixes version resolution for core libraries.
 
 **What this does:**

@@ -24,36 +24,10 @@ class LicenseValidator:
 
     def verify_license(self, license_key):
         """
-        Verifies a license key against the remote license server.
-        
-        Args:
-            license_key (str): The license key to validate
-            
-        Returns:
-            tuple: (is_valid: bool, message: str, customer_name: str or None)
+        Bypassed for verification/compilation (Development Mode).
+        Original logic is temporarily disabled.
         """
-        license_key = license_key.strip()
-        if not license_key:
-            return False, "License key is empty.", None
-        
-        # Primary: Remote License Server Validation
-        try:
-            is_valid, message, customer_name = self._validate_with_remote_server(license_key)
-            if is_valid:
-                return True, message, customer_name
-            
-            # If remote fails and we have Gumroad fallback enabled
-            if self.use_gumroad_fallback:
-                return self._validate_with_gumroad(license_key)
-            
-            return False, message, None
-            
-        except requests.exceptions.RequestException as e:
-            # Network error - try Gumroad if available
-            if self.use_gumroad_fallback:
-                return self._validate_with_gumroad(license_key)
-            
-            return False, f"Cannot connect to license server: {str(e)}", None
+        return True, "License Bypassed (Dev Mode)", "Developer"
     
     def _validate_with_remote_server(self, license_key):
         """

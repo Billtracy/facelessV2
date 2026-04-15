@@ -1,11 +1,20 @@
 {
+    "llm_provider": "groq",
+    "gemini_api_key": "",
     "groq_api_key": "",
+    "pollen_api_key": "",
+    "video_provider": "pexels",
+    "pixabay_api_key": "",
     "pexels_api_key": "",
     "output_folder": "output",
+    "last_blueprint": "Custom Topic",
     "last_topic": "",
-    "last_mood": "Darkness",
+    "last_mood": "darkness",
     "last_voice": "en-US-ChristopherNeural",
-    "last_font": "Arial-Bold",
+    "last_voice_kokoro": "af",
+    "last_font": "Anton-Regular",
+    "video_format": "Shorts",
+    "tts_provider": "kokoro",
     "prompt_template": "",
     "license_key": ""
 }

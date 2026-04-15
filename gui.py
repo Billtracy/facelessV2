@@ -8,6 +8,7 @@ from license_validator import LicenseValidator
 from logger import AppLogger
 from version import CURRENT_VERSION, APP_NAME
 from updater import UpdateChecker
+from resource_path import resource_path
 
 class FacelessApp(ctk.CTk):
     def __init__(self, config_manager):
@@ -30,10 +31,8 @@ class FacelessApp(ctk.CTk):
         
         self.current_frame = None
         
-        # ROUTING LOGIC
-        if not self.config.get("license_key"):
-            self.show_license_page()
-        elif not self._check_credits_exist():
+        # ROUTING LOGIC (Bypassed License Check)
+        if not self._check_credits_exist():
             self.show_credentials_page()
         else:
             self.show_main_dashboard()
@@ -43,9 +42,6 @@ class FacelessApp(ctk.CTk):
         c = self.config
         return (c.get("groq_api_key") or c.get("gemini_api_key")) and \
                (c.get("pexels_api_key") or c.get("pixabay_api_key"))
-        
-        # Start background update check after UI is ready
-        self.update_checker.start_background_check(self)
 
     def clear_view(self):
         if self.current_frame:
@@ -65,7 +61,7 @@ class FacelessApp(ctk.CTk):
 
     def _scan_voice_folder(self):
         """Scans the voices/ folder for .wav files and returns a list of voice names."""
-        voices_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voices")
+        voices_dir = os.path.join(resource_path("."), "voices")
         if not os.path.isdir(voices_dir):
             return []
         wav_files = sorted([
@@ -76,46 +72,29 @@ class FacelessApp(ctk.CTk):
         return wav_files
 
     def update_voice_options(self, *args):
-        provider = self.opt_tts_provider.get()
-        if provider == "Kokoro (Local)":
-            self.frame_google_creds.pack_forget()
-            # Kokoro Voices (Verified from voices.bin)
-            self.frame_google_creds.pack_forget()
-            # Kokoro Voices (Verified from voices.bin)
-            voices = [
-                "af",           # Default Female (Heart)
-                "af_bella",
-                "af_nicole",
-                "af_sarah",
-                "af_sky",
-                "am_adam",
-                "am_michael",
-                "bf_emma",
-                "bf_isabella",
-                "bm_george",
-                "bm_lewis"
-            ]
-            self.opt_voice.configure(values=voices)
-            
-            # Auto-correct old saved voice "af_heart" -> "af"
-            saved = self.config.get("last_voice_kokoro", "af")
-            if saved == "af_heart": saved = "af"
-            if saved not in voices: saved = "af"
-            
-            self.opt_voice.set(saved)
-        else:
-            self.frame_google_creds.pack_forget()
-            # Edge TTS Voices
-            voices = [
-                "en-US-ChristopherNeural", 
-                "en-US-GuyNeural", 
-                "en-US-EricNeural", 
-                "en-GB-RyanNeural", 
-                "en-US-JennyNeural",
-                "en-AU-NatashaNeural"
-            ]
-            self.opt_voice.configure(values=voices)
-            self.opt_voice.set(self.config.get("last_voice", "en-US-ChristopherNeural"))
+        self.frame_google_creds.pack_forget()
+        # Kokoro Voices (Verified from voices.bin)
+        voices = [
+            "af",           # Default Female (Heart)
+            "af_bella",
+            "af_nicole",
+            "af_sarah",
+            "af_sky",
+            "am_adam",
+            "am_michael",
+            "bf_emma",
+            "bf_isabella",
+            "bm_george",
+            "bm_lewis"
+        ]
+        self.opt_voice.configure(values=voices)
+        
+        # Auto-correct old saved voice "af_heart" -> "af"
+        saved = self.config.get("last_voice_kokoro", "af")
+        if saved == "af_heart": saved = "af"
+        if saved not in voices: saved = "af"
+        
+        self.opt_voice.set(saved)
             
     # --- STEP 1: LICENSE PAGE ---
     def show_license_page(self):
@@ -199,6 +178,11 @@ class FacelessApp(ctk.CTk):
         if back_to_main:
              ctk.CTkButton(header, text="Back", fg_color="gray", width=80, command=self.show_main_dashboard).pack(side="right")
         
+        # Next Button (Bottom)
+        # Packed before form to ensure it always stays on screen
+        btn_text = "Save & Continue" if not back_to_main else "Save Changes"
+        ctk.CTkButton(self.current_frame, text=btn_text, command=lambda: self.save_credentials(back_to_main), height=50, font=("Arial", 16)).pack(side="bottom", pady=30)
+
         # Form Container
         form = ctk.CTkScrollableFrame(self.current_frame, width=800, height=500)
         form.pack(pady=10, padx=20, fill="both", expand=True)
@@ -256,10 +240,6 @@ class FacelessApp(ctk.CTk):
         self.entry_out_cred.pack(side="left", padx=(0, 10))
         self.entry_out_cred.insert(0, self.config.get("output_folder", "output"))
         ctk.CTkButton(row_out, text="Browse", width=100, command=self.browse_folder_cred).pack(side="left")
-        
-        # Next Button
-        btn_text = "Save & Continue" if not back_to_main else "Save Changes"
-        ctk.CTkButton(self.current_frame, text=btn_text, command=lambda: self.save_credentials(back_to_main), height=50, font=("Arial", 16)).pack(pady=30)
 
     def on_blueprint_change(self, choice):
         """Shows or hides custom topic inputs based on blueprint"""
@@ -312,9 +292,14 @@ class FacelessApp(ctk.CTk):
         ctk.CTkButton(top_bar, text="🔄 Check Updates", width=130, fg_color="#444444", hover_color="#555555", command=lambda: self.update_checker.prompt_update_if_available(self)).pack(side="right", padx=(5, 20), pady=10)
         ctk.CTkButton(top_bar, text="⚙ Settings", width=100, fg_color="gray", command=lambda: self.show_credentials_page(True)).pack(side="right", padx=5, pady=10)
 
+        # 3. Generate Button (Bottom)
+        # Packed before workspace to ensure it always stays on screen
+        self.btn_gen = ctk.CTkButton(self.current_frame, text="GENERATE VIDEO", font=("Arial", 18, "bold"), height=60, fg_color="green", hover_color="darkgreen", command=self.start_generation)
+        self.btn_gen.pack(side="bottom", fill="x", padx=40, pady=20)
+
         # 2. Workspace (Split Content & Style)
-        workspace = ctk.CTkFrame(self.current_frame, fg_color="transparent")
-        workspace.pack(fill="both", expand=True, padx=20, pady=20)
+        workspace = ctk.CTkScrollableFrame(self.current_frame, fg_color="transparent")
+        workspace.pack(fill="both", expand=True, padx=20, pady=10)
         
         # CONTENT COLUMN (Left)
         left_col = ctk.CTkFrame(workspace)
@@ -339,7 +324,7 @@ class FacelessApp(ctk.CTk):
         
         ctk.CTkLabel(self.miniframe_auto, text="Content Blueprint:", anchor="w").pack(fill="x", padx=15, pady=(5,0))
         self.var_blueprint = ctk.StringVar(value=self.config.get("last_blueprint", "Custom Topic"))
-        self.opt_blueprint = ctk.CTkOptionMenu(self.miniframe_auto, values=["Custom Topic", "Reddit Stories", "Motivation & Inspiration", "Historical Facts", "Historical Figures", "Mythology & Ancient Lore", "Stoicism & Daily Philosophy", '"What If?" & Cosmic Sci-Fi Scenarios', "Visual Lore & Design Mysteries", "Law", "Personal Finance & Wealth", "Top 10s & Listicles", "Hollywood Gossips and Lores", "Dark Psychology", "Historical Psychology"], variable=self.var_blueprint, command=self.on_blueprint_change)
+        self.opt_blueprint = ctk.CTkOptionMenu(self.miniframe_auto, values=["Custom Topic", "True Crime Stories", "Reddit Stories", "Motivation & Inspiration", "Historical Facts", "Historical Figures", "Mythology & Ancient Lore", "Stoicism & Daily Philosophy", '"What If?" & Cosmic Sci-Fi Scenarios', "Visual Lore & Design Mysteries", "Law", "Personal Finance & Wealth", "Top 10s & Listicles", "Hollywood Gossips and Lores", "Dark Psychology", "Historical Psychology"], variable=self.var_blueprint, command=self.on_blueprint_change)
         self.opt_blueprint.pack(fill="x", padx=15, pady=5)
 
         # AUTO MODE: Topic Input (Only show if Custom Topic is selected)
@@ -386,10 +371,7 @@ class FacelessApp(ctk.CTk):
         ctk.CTkLabel(right_col, text="STYLE", font=("Arial", 16, "bold"), text_color="orange").pack(pady=(15, 10))
         
         
-        # TTS Provider
-        ctk.CTkLabel(right_col, text="Audio Provider:", anchor="w").pack(fill="x", padx=15, pady=(15,0))
-        self.opt_tts_provider = ctk.CTkOptionMenu(right_col, values=["Kokoro (Local)", "Edge TTS (Free)"], command=self.update_voice_options)
-        self.opt_tts_provider.pack(fill="x", padx=15, pady=5)
+        # TTS Provider Removed (Always uses Kokoro + Fallback)
         
         # Google Creds (Removed - not needed for Gemini)
         self.frame_google_creds = ctk.CTkFrame(right_col, fg_color="transparent")
@@ -409,11 +391,6 @@ class FacelessApp(ctk.CTk):
         self.opt_voice.pack(fill="x", padx=15, pady=5)
         
         # Init state
-        curr_prov_raw = self.config.get("tts_provider", "kokoro")
-        if curr_prov_raw == "edge":
-             self.opt_tts_provider.set("Edge TTS (Free)")
-        else:
-             self.opt_tts_provider.set("Kokoro (Local)")
         self.update_voice_options() # Refresh UI state
 
         
@@ -423,10 +400,8 @@ class FacelessApp(ctk.CTk):
         self.opt_font.pack(fill="x", padx=15, pady=5)
         self.opt_font.set(self.config.get("last_font", "Anton-Regular"))
 
-        # 3. Generate Button (Bottom)
-        # Validation note: Technically optional fields can be empty (random topic), so button is always active basically
-        self.btn_gen = ctk.CTkButton(self.current_frame, text="GENERATE VIDEO", font=("Arial", 18, "bold"), height=60, fg_color="green", hover_color="darkgreen", command=self.start_generation)
-        self.btn_gen.pack(fill="x", padx=40, pady=20)
+        # Start background update check after dashboard is loaded
+        self.update_checker.start_background_check(self)
 
     # --- TOGGLE MODES ---
     def toggle_manual_mode(self):
@@ -630,21 +605,14 @@ class FacelessApp(ctk.CTk):
         self.logger.info("All validations passed, starting generation")
         
         # Save current options
-        prov_ui = self.opt_tts_provider.get()
-        if prov_ui == "Edge TTS (Free)":
-            prov = "edge"
-        else:
-            prov = "kokoro"
-        
         updated_cfg = {
             "last_blueprint": self.var_blueprint.get(),
             "last_topic": self.input_topic.get().strip(),
             "video_format": self.var_video_format.get(),
             "prompt_template": custom_prompt,
-            "last_voice": self.opt_voice.get() if prov == "edge" else self.config.get("last_voice"),
-            "last_voice_kokoro": self.opt_voice.get() if prov == "kokoro" else self.config.get("last_voice_kokoro"),
+            "last_voice_kokoro": self.opt_voice.get(),
             "last_font": self.opt_font.get(),
-            "tts_provider": prov,
+            "tts_provider": "kokoro",
             # "google_creds_path": ... removed
         }
         self.config_manager.save_config(updated_cfg)

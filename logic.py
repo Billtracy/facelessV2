@@ -13,6 +13,7 @@ from pydub.silence import detect_nonsilent
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 from retry_utils import retry_with_backoff
+from resource_path import resource_path, app_dir
 import soundfile as sf
 import movis
 
@@ -228,6 +229,12 @@ class ViralSafeBot:
                 "task": "Provide a deep psychological breakdown of a famous historical figure's motivations or the hidden psychological impact of a major historical event.",
                 "hook": "Start with a question like 'Why did [Figure] really do it?' or 'What if I told you the true cause of [Event] was a simple human psychological flaw?'",
                 "cta": "Ask: 'Which historical mystery should we analyze next? Subscribe for more deep dives.'"
+            },
+            "True Crime Stories": {
+                "role": "a meticulous true crime documentarian.",
+                "task": "Write an intense, suspenseful true crime script about a fascinating unsolved mystery or infamous case.",
+                "hook": "Start with a chilling fact or a terrifying realization about the case.",
+                "cta": "Ask the viewers: 'Who do you think did it? Let me know.'"
             }
         }
 
@@ -489,9 +496,11 @@ class ViralSafeBot:
                 temp_wav = file_path + ".temp_loader.wav"
                 
                 import subprocess
+                import imageio_ffmpeg
+                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
                 # Run ffmpeg to extract audio as wav
                 subprocess.run(
-                    ["ffmpeg", "-y", "-i", file_path, "-acodec", "pcm_s16le", "-ar", "44100", temp_wav],
+                    [ffmpeg_exe, "-y", "-i", file_path, "-acodec", "pcm_s16le", "-ar", "44100", temp_wav],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     check=True
@@ -511,14 +520,11 @@ class ViralSafeBot:
     async def generate_audio_for_line(self, text, index):
         filename = f"{self.temp_folder}/line_{index}.mp3"
         
-        # Determine Provider
-        provider = self.config.get("tts_provider", "kokoro")
-        
-        if provider == "kokoro":
-             voice_id = self.config.get("last_voice_kokoro", "af_heart")
-             # Directly await the async method
+        try:
+             voice_id = self.config.get("last_voice_kokoro", "af")
              await self._generate_kokoro_tts(text, voice_id, filename)
-        else:
+        except Exception as e:
+             self.log(f"[!] Kokoro TTS failed: {e}. Falling back to Edge TTS.")
              # Default Edge TTS
              voice_id = self.config.get("last_voice", "en-US-ChristopherNeural")
              # +10% speed is the viral sweet spot
@@ -529,7 +535,7 @@ class ViralSafeBot:
 
     def _ensure_kokoro_models(self):
         """Checks for Kokoro models and lowers them if missing"""
-        models_dir = os.path.join(os.getcwd(), "models")
+        models_dir = os.path.join(app_dir(), "models")
         os.makedirs(models_dir, exist_ok=True)
         
         onnx_path = os.path.join(models_dir, "kokoro-v0_19.int8.onnx")
@@ -1087,7 +1093,7 @@ class ViralSafeBot:
              user_font_file = font_map.get(font_name, "Anton-Regular.ttf")
              
              # Check if it's in the assets/fonts folder first
-             local_font_path = os.path.join("assets", "fonts", user_font_file)
+             local_font_path = os.path.join(resource_path("assets"), "fonts", user_font_file)
              if os.path.exists(local_font_path):
                  font_file = local_font_path
              else:
@@ -1099,7 +1105,7 @@ class ViralSafeBot:
         except Exception as e:
              # Silencing the font fallback warnings
              try:
-                 default_font_path = os.path.join("assets", "fonts", "Anton-Regular.ttf")
+                 default_font_path = os.path.join(resource_path("assets"), "fonts", "Anton-Regular.ttf")
                  font = ImageFont.truetype(default_font_path, fontsize)
                  active_font = ImageFont.truetype(default_font_path, fontsize + 12)
              except Exception as inner_e:
@@ -1273,7 +1279,7 @@ class ViralSafeBot:
     def get_sfx(self, name):
         """Helper to get SFX audio segment"""
         # sfx paths
-        base_sfx = os.path.join("assets", "sfx")
+        base_sfx = os.path.join(resource_path("assets"), "sfx")
         path = os.path.join(base_sfx, name)
         
         if not os.path.exists(path):
@@ -1542,9 +1548,11 @@ class ViralSafeBot:
         # Mux audio with FFmpeg
         self.report_progress(95, "Muxing Audio with FFmpeg...")
         import subprocess
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         try:
              subprocess.run([
-                 "ffmpeg", "-y", "-i", temp_vid, "-i", final_audio_path,
+                 ffmpeg_exe, "-y", "-i", temp_vid, "-i", final_audio_path,
                  "-c:v", "copy", "-c:a", "aac", out_file
              ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
@@ -1566,9 +1574,6 @@ class ViralSafeBot:
         """Async wrapper for the full process"""
         try:
             self.report_progress(0, "Initializing and checking API keys...")
-
-            if not self.client:
-                 return False, "Groq Client not initialized (Check API Key)."
 
             self.report_progress(10, "Generating Viral Script with AI...")
             script, error = self.generate_script_and_topic()
