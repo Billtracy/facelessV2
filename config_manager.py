@@ -1,8 +1,14 @@
 import json
 import os
+import shutil
+
+from paths import user_data_root, app_dir
 
 class ConfigManager:
-    def __init__(self, filename="settings.json"):
+    def __init__(self, filename=None):
+        if filename is None:
+            filename = os.path.join(user_data_root(), "settings.json")
+            self._migrate_legacy_config(filename)
         self.filename = filename
         self.default_config = {
             "llm_provider": "groq",
@@ -21,6 +27,19 @@ class ConfigManager:
             "license_key": ""
         }
         self.config = self.load_config()
+
+    def _migrate_legacy_config(self, new_path):
+        """Older versions stored settings.json next to the app or in the cwd."""
+        if os.path.exists(new_path):
+            return
+        for legacy in (os.path.join(app_dir(), "settings.json"),
+                       os.path.join(os.getcwd(), "settings.json")):
+            if os.path.exists(legacy):
+                try:
+                    shutil.copy2(legacy, new_path)
+                except OSError as e:
+                    print(f"Could not migrate legacy settings: {e}")
+                return
 
     def load_config(self):
         """Loads configuration from the file. Returns defaults if file is missing or invalid."""

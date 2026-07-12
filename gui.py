@@ -9,7 +9,7 @@ from license_validator import LicenseValidator
 from logger import AppLogger
 from version import CURRENT_VERSION, APP_NAME
 from updater import UpdateChecker
-from resource_path import resource_path
+from paths import resource_path
 
 class FacelessApp(ctk.CTk):
     def __init__(self, config_manager):
@@ -42,12 +42,15 @@ class FacelessApp(ctk.CTk):
             self.show_credentials_page()
         else:
             self.show_main_dashboard()
-            
+
+        # Start background update check after UI is ready
+        self.update_checker.start_background_check(self)
+
     def _check_credits_exist(self):
-        # Basic check if at least one LLM and one Video key exists
+        # At least one LLM key is required; visuals have built-in fallbacks
+        # (Pollinations needs no key, Pexels key is optional)
         c = self.config
-        return (c.get("groq_api_key") or c.get("gemini_api_key")) and \
-               (c.get("pexels_api_key") or c.get("pixabay_api_key"))
+        return bool(c.get("groq_api_key") or c.get("gemini_api_key"))
 
     def clear_view(self):
         if self.current_frame:
@@ -67,7 +70,7 @@ class FacelessApp(ctk.CTk):
 
     def _scan_voice_folder(self):
         """Scans the voices/ folder for .wav files and returns a list of voice names."""
-        voices_dir = os.path.join(resource_path("."), "voices")
+        voices_dir = resource_path("voices")
         if not os.path.isdir(voices_dir):
             return []
         wav_files = sorted([
@@ -78,6 +81,9 @@ class FacelessApp(ctk.CTk):
         return wav_files
 
     def update_voice_options(self, *args):
+        # TTS Provider dropdown was removed from the dashboard (Kokoro-only,
+        # with an internal Edge TTS fallback already in logic.py), so this
+        # no longer branches on a provider widget.
         self.frame_google_creds.pack_forget()
         # Kokoro Voices (Verified from voices.bin)
         voices = [
@@ -94,14 +100,15 @@ class FacelessApp(ctk.CTk):
             "bm_lewis"
         ]
         self.opt_voice.configure(values=voices)
-        
+
         # Auto-correct old saved voice "af_heart" -> "af"
         saved = self.config.get("last_voice_kokoro", "af")
         if saved == "af_heart": saved = "af"
         if saved not in voices: saved = "af"
-        
+
         self.opt_voice.set(saved)
-            
+
+
     # --- STEP 1: LICENSE PAGE ---
     def show_license_page(self):
         self.clear_view()
@@ -236,7 +243,14 @@ class FacelessApp(ctk.CTk):
         self.entry_pollen_cred = ctk.CTkEntry(self.frame_pollen, width=600, placeholder_text="...")
         self.entry_pollen_cred.pack(anchor="w", pady=(0, 5))
         self.entry_pollen_cred.insert(0, self.config.get("pollen_api_key", ""))
-        
+
+        # Pexels API Key (Optional - stock video fallback when image gen fails)
+        ctk.CTkLabel(form, text="Pexels API Key (Optional Stock Video Fallback):", font=("Arial", 14, "bold")).pack(anchor="w", pady=(10, 5))
+        ctk.CTkLabel(form, text="Get a free key at pexels.com/api - used when AI image generation is unavailable.", text_color="gray", font=("Arial", 11)).pack(anchor="w")
+        self.entry_pexels_cred = ctk.CTkEntry(form, width=600, placeholder_text="...")
+        self.entry_pexels_cred.pack(anchor="w", pady=(0, 10))
+        self.entry_pexels_cred.insert(0, self.config.get("pexels_api_key", ""))
+
         # Initial Visibility Update
         self.update_settings_visibility()
         
@@ -281,6 +295,7 @@ class FacelessApp(ctk.CTk):
              "groq_api_key": self.entry_groq_cred.get().strip(),
              "gemini_api_key": self.entry_gemini_cred.get().strip(),
              "pollen_api_key": self.entry_pollen_cred.get().strip(),
+             "pexels_api_key": self.entry_pexels_cred.get().strip(),
              "output_folder": self.entry_out_cred.get().strip()
         }
         self.config_manager.save_config(new_conf)

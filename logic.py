@@ -4,6 +4,7 @@ import asyncio
 import random
 import re
 import shutil
+import subprocess
 import requests
 import traceback
 import time
@@ -25,7 +26,7 @@ from pydub.silence import detect_nonsilent
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 from retry_utils import retry_with_backoff
-from resource_path import resource_path, app_dir
+from paths import resource_path, user_data_root, user_data_dir, app_dir
 import soundfile as sf
 import movis
 import text_utils
@@ -78,7 +79,9 @@ class ViralSafeBot:
         if self.output_folder == "output":
              self.output_folder = downloads_path
              
-        self.temp_folder = "temp_assets"
+        # Temp files go to the per-user data folder: the exe folder may be
+        # read-only and the cwd is unreliable when launched from a shortcut.
+        self.temp_folder = os.path.join(user_data_root(), "temp_assets")
         os.makedirs(self.output_folder, exist_ok=True)
         
         # Clean up old temp files from previous runs
@@ -115,6 +118,27 @@ class ViralSafeBot:
              self.log(f"[*] FFMPEG found via imageio_ffmpeg: {ffmpeg_path}")
         except Exception as e:
              self.log(f"[!] Warning: Could not locate imageio ffmpeg: {e}")
+
+    def _run_ffmpeg(self, args):
+        """
+        Run the bundled ffmpeg binary without flashing a console window.
+        Captures stderr so a failure carries ffmpeg's real message instead
+        of just an opaque exit code.
+        """
+        kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+        }
+        if os.name == 'nt':
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        proc = subprocess.run([self.ffmpeg_exe] + args, **kwargs)
+        if proc.returncode != 0:
+            # Keep the last few lines of ffmpeg output - the reason is at the end
+            tail = "\n".join((proc.stderr or "").strip().splitlines()[-6:])
+            raise RuntimeError(
+                f"ffmpeg exited with code {proc.returncode}.\n{tail}"
+            )
 
     def log(self, message):
         """Log messages to console, callback, and file logger"""
@@ -388,18 +412,24 @@ class ViralSafeBot:
 
     def safe_load_audio(self, file_path):
         """
-        Robustly load audio files.
-        If pydub fails (often due to missing ffprobe/ffmpeg in PATH),
-        fallback to using moviepy (which has bundled ffmpeg) to convert to WAV first.
+        Robustly load audio files without requiring ffmpeg/ffprobe on PATH.
+        pydub's generic from_file() shells out to ffprobe, which customer
+        machines don't have, so WAV gets a pure-python fast path and
+        everything else falls back to the bundled imageio ffmpeg binary.
         """
         if not os.path.exists(file_path):
             self.log(f"[!] Audio file missing: {file_path}")
-            # Return silent segment to avoid crash, or raise? 
-            # Better to raise so we know logic failed, but let's try to return functionality
             return AudioSegment.silent(duration=500)
 
+        # 1. WAV fast path (no ffmpeg/ffprobe involved)
+        if file_path.lower().endswith(".wav"):
+            try:
+                return AudioSegment.from_wav(file_path)
+            except Exception:
+                pass
+
+        # 2. Direct load (works when ffmpeg/ffprobe are installed system-wide)
         try:
-            # 1. Try direct load
             return AudioSegment.from_file(file_path)
         except Exception:
             try:
@@ -417,31 +447,44 @@ class ViralSafeBot:
                     check=True
                 )
 
-                seg = AudioSegment.from_wav(temp_wav)
-                
-                # Cleanup temp wav
-                if os.path.exists(temp_wav):
+        # 3. Fallback: bundled FFmpeg -> WAV -> pydub
+        temp_wav = file_path + ".temp_loader.wav"
+        try:
+            self._run_ffmpeg(["-y", "-i", file_path, "-acodec", "pcm_s16le", "-ar", "44100", temp_wav])
+            return AudioSegment.from_wav(temp_wav)
+        except Exception as fallback_error:
+            self.log(f"[!] CRITICAL: Failed to load audio {file_path} even with fallback. Error: {fallback_error}")
+            raise
+        finally:
+            if os.path.exists(temp_wav):
+                try:
                     os.remove(temp_wav)
-                    
-                return seg
-            except Exception as fallback_error:
-                self.log(f"[!] CRITICAL: Failed to load audio {file_path} even with fallback. Error: {fallback_error}")
-                raise fallback_error
+                except OSError:
+                    pass
 
     async def generate_audio_for_line(self, text, index):
+        # Determine Provider
+        provider = self.config.get("tts_provider", "kokoro")
+
+        if provider == "kokoro":
+            # WAV: written by soundfile, loadable without ffmpeg.
+            # _generate_kokoro_tts raises on failure - fall through to a
+            # fresh .mp3 path for Edge TTS rather than reusing this one
+            # (Edge TTS writes MP3 bytes, which would corrupt a .wav path).
+            filename = f"{self.temp_folder}/line_{index}.wav"
+            try:
+                voice_id = self.config.get("last_voice_kokoro", "af_heart")
+                await self._generate_kokoro_tts(text, voice_id, filename)
+                return filename
+            except Exception as e:
+                self.log(f"[!] Kokoro TTS failed: {e}. Falling back to Edge TTS.")
+
+        # Default Edge TTS (either selected provider, or Kokoro fallback)
         filename = f"{self.temp_folder}/line_{index}.mp3"
-        
-        try:
-             voice_id = self.config.get("last_voice_kokoro", "af")
-             await self._generate_kokoro_tts(text, voice_id, filename)
-        except Exception as e:
-             self.log(f"[!] Kokoro TTS failed: {e}. Falling back to Edge TTS.")
-             # Default Edge TTS
-             voice_id = self.config.get("last_voice", "en-US-ChristopherNeural")
-             # +10% speed is the viral sweet spot
-             communicate = edge_tts.Communicate(text, voice_id, rate="+10%")
-             await communicate.save(filename)
-             
+        voice_id = self.config.get("last_voice", "en-US-ChristopherNeural")
+        # +10% speed is the viral sweet spot
+        communicate = edge_tts.Communicate(text, voice_id, rate="+10%")
+        await communicate.save(filename)
         return filename
 
     def _ensure_kokoro_models(self):
@@ -719,10 +762,17 @@ class ViralSafeBot:
                 req_headers = {"Connection": "close"}
                 with requests.get(video_link, headers=req_headers, stream=True, timeout=120) as r:
                     r.raise_for_status()
+                    expected = int(r.headers.get("Content-Length", 0))
+                    written = 0
                     with open(v_output_path, 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=8192): 
+                        for chunk in r.iter_content(chunk_size=8192):
                             if chunk:
                                 f.write(chunk)
+                                written += len(chunk)
+                # A truncated download decodes past its header but breaks movis
+                # mid-render, so reject it here and let retry_with_backoff retry.
+                if expected and written < expected:
+                    raise IOError(f"Truncated video download: got {written} of {expected} bytes")
                 return v_output_path
             
             loop = asyncio.get_event_loop()
@@ -760,9 +810,12 @@ class ViralSafeBot:
         return msg if success else None
 
     async def _search_pexels(self, query):
-        # HARDCODED API KEY FOR BACKGROUND FALLBACK
-        key = "3vDp08ehXYBwPMaKMUgHED9Jqxa3cvykQoiQMjSsvx0dMGvPRN1TwfYp"
-        
+        # Prefer the customer's own key (Settings); the shared fallback key
+        # ships inside the binary and can get rate-limited for everyone.
+        key = (self.config.get("pexels_api_key") or "").strip()
+        if not key:
+            key = "3vDp08ehXYBwPMaKMUgHED9Jqxa3cvykQoiQMjSsvx0dMGvPRN1TwfYp"
+
         headers = {'Authorization': key, 'Connection': 'close'}
         orientation = "landscape" if self.config.get("video_format") == "Long Form" else "portrait"
         url = f"https://api.pexels.com/videos/search?query={query}&orientation={orientation}&per_page=10"
@@ -857,8 +910,8 @@ class ViralSafeBot:
              # Fallback to Anton-Regular if Arial isn't requested or isn't available
              user_font_file = font_map.get(font_name, "Anton-Regular.ttf")
              
-             # Check if it's in the assets/fonts folder first
-             local_font_path = os.path.join(resource_path("assets"), "fonts", user_font_file)
+             # Check if it's in the bundled assets/fonts folder first
+             local_font_path = resource_path("assets", "fonts", user_font_file)
              if os.path.exists(local_font_path):
                  font_file = local_font_path
              else:
@@ -870,7 +923,7 @@ class ViralSafeBot:
         except Exception as e:
              # Silencing the font fallback warnings
              try:
-                 default_font_path = os.path.join(resource_path("assets"), "fonts", "Anton-Regular.ttf")
+                 default_font_path = resource_path("assets", "fonts", "Anton-Regular.ttf")
                  font = ImageFont.truetype(default_font_path, fontsize)
                  active_font = ImageFont.truetype(default_font_path, fontsize + 12)
              except Exception as inner_e:
@@ -1046,13 +1099,11 @@ class ViralSafeBot:
 
     def get_sfx(self, name):
         """Helper to get SFX audio segment"""
-        # sfx paths
-        base_sfx = os.path.join(resource_path("assets"), "sfx")
-        path = os.path.join(base_sfx, name)
-        
+        path = resource_path("assets", "sfx", name)
+
         if not os.path.exists(path):
             return None
-            
+
         try:
             # Check file size, if 0 byte (placeholder), return silent
             if os.path.getsize(path) < 100:

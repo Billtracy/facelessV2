@@ -85,10 +85,10 @@ If you have `app_icon.png`:
 
 ### Step 3: Run the Build Command
 
-**PREFERRED METHOD — Use the .spec file:**
+The entire build is defined in `main.spec` (data files, hidden imports, assets, icon, windowed mode). Just run:
 
 ```bash
-pyinstaller FacelessGenerator.spec --noconfirm
+pyinstaller --noconfirm main.spec
 ```
 
 **OR copy and paste this command (verified working — see note below):**
@@ -142,10 +142,11 @@ pyinstaller --noconfirm --onedir --windowed --name "FacelessGenerator" --add-dat
 
 ### Test 3: Check Auto-Created Files
 
-The app should create:
-- `settings.json` in the EXE folder (your customer's config, separate from yours!).
-- Log files at `%APPDATA%/FacelessGenerator/logs/`.
-- `models/` folder (on first run) containing the Kokoro TTS voice files.
+The app should create everything under `%APPDATA%/FacelessGenerator/` (the EXE folder stays untouched — it may be read-only on customer machines):
+- `settings.json` (your customer's config, separate from yours!).
+- `logs/` with the log files.
+- `models/` (on first run) containing the Kokoro TTS voice files.
+- `temp_assets/` during generation (cleaned up automatically).
 
 ### Test 4: Verify No Leaked Data
 
@@ -164,8 +165,8 @@ The app should create:
 
 Before zipping, optionally delete these (saves space):
 - `build/` folder (not needed).
-- `*.spec` files (not needed).
 - Keep only `dist/FacelessGenerator/`.
+- **Do NOT delete `main.spec`** — it defines the build and is version-controlled.
 
 ### Step 2: Create Distribution Archive
 
@@ -233,11 +234,9 @@ Need help? Reply to this email!
    ```bash
    rmdir /s dist
    rmdir /s build
-   del *.spec
    ```
 
-2. Rebuild with the updated command (includes `--collect-all`).
-udes `--collect-all customtkinter`)
+2. Rebuild with `pyinstaller --noconfirm main.spec` (the spec already collects everything). If a *new* library is missing, add it to the `collect_packages` list in `main.spec`.
 
 3. If still failing, try this alternative:
    ```bash

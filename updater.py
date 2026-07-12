@@ -33,6 +33,10 @@ class UpdateChecker:
                    - download_url: str URL to download the update
                    - new_version: str version number of the new release
         """
+        # Skip silently until a real version.json URL is configured
+        if "YOUR_WEBSITE" in self.remote_url:
+            return (False, "", "")
+
         try:
             response = requests.get(self.remote_url, timeout=5)
             response.raise_for_status()
@@ -60,82 +64,85 @@ class UpdateChecker:
             parent_window: The parent CTk window to center the dialog on
         """
         is_available, download_url, new_version = self.check_for_updates()
-        
+
         if is_available and download_url:
-            # Create update dialog
-            dialog = ctk.CTkToplevel(parent_window)
-            dialog.title("Update Available")
-            dialog.geometry("450x250")
-            dialog.resizable(False, False)
-            
-            # Center the dialog
-            dialog.lift()
-            dialog.focus()
-            
-            # Content
-            frame = ctk.CTkFrame(dialog)
-            frame.pack(fill="both", expand=True, padx=20, pady=20)
-            
-            ctk.CTkLabel(
-                frame, 
-                text="🎉 Update Available!", 
-                font=("Arial", 20, "bold"),
-                text_color="#00FF88"
-            ).pack(pady=(10, 5))
-            
-            ctk.CTkLabel(
-                frame,
-                text=f"Version {new_version} is now available!",
-                font=("Arial", 14)
-            ).pack(pady=5)
-            
-            ctk.CTkLabel(
-                frame,
-                text=f"(You're running version {CURRENT_VERSION})",
-                font=("Arial", 11),
-                text_color="gray"
-            ).pack(pady=(0, 20))
-            
-            ctk.CTkLabel(
-                frame,
-                text="Your license key will work on the new version.\nWould you like to download it now?",
-                font=("Arial", 12)
-            ).pack(pady=10)
-            
-            # Buttons
-            btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
-            btn_frame.pack(pady=20)
-            
-            def download_update():
-                webbrowser.open(download_url)
-                dialog.destroy()
-            
-            ctk.CTkButton(
-                btn_frame,
-                text="Download Update",
-                command=download_update,
-                width=150,
-                height=40,
-                fg_color="green",
-                hover_color="darkgreen"
-            ).pack(side="left", padx=10)
-            
-            ctk.CTkButton(
-                btn_frame,
-                text="Not Now",
-                command=dialog.destroy,
-                width=150,
-                height=40,
-                fg_color="gray",
-                hover_color="darkgray"
-            ).pack(side="left", padx=10)
-            
-            # Make dialog modal
-            dialog.transient(parent_window)
-            dialog.grab_set()
+            self._show_update_dialog(parent_window, download_url, new_version)
         else:
             # No update available - could show message or do nothing
             pass
+
+    def _show_update_dialog(self, parent_window, download_url, new_version):
+        """Build and show the update dialog (must run on the main thread)."""
+        dialog = ctk.CTkToplevel(parent_window)
+        dialog.title("Update Available")
+        dialog.geometry("450x250")
+        dialog.resizable(False, False)
+
+        # Center the dialog
+        dialog.lift()
+        dialog.focus()
+
+        # Content
+        frame = ctk.CTkFrame(dialog)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(
+            frame,
+            text="🎉 Update Available!",
+            font=("Arial", 20, "bold"),
+            text_color="#00FF88"
+        ).pack(pady=(10, 5))
+
+        ctk.CTkLabel(
+            frame,
+            text=f"Version {new_version} is now available!",
+            font=("Arial", 14)
+        ).pack(pady=5)
+
+        ctk.CTkLabel(
+            frame,
+            text=f"(You're running version {CURRENT_VERSION})",
+            font=("Arial", 11),
+            text_color="gray"
+        ).pack(pady=(0, 20))
+
+        ctk.CTkLabel(
+            frame,
+            text="Your license key will work on the new version.\nWould you like to download it now?",
+            font=("Arial", 12)
+        ).pack(pady=10)
+
+        # Buttons
+        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_frame.pack(pady=20)
+
+        def download_update():
+            webbrowser.open(download_url)
+            dialog.destroy()
+
+        ctk.CTkButton(
+            btn_frame,
+            text="Download Update",
+            command=download_update,
+            width=150,
+            height=40,
+            fg_color="green",
+            hover_color="darkgreen"
+        ).pack(side="left", padx=10)
+
+        ctk.CTkButton(
+            btn_frame,
+            text="Not Now",
+            command=dialog.destroy,
+            width=150,
+            height=40,
+            fg_color="gray",
+            hover_color="darkgray"
+        ).pack(side="left", padx=10)
+
+        # Make dialog modal
+        dialog.transient(parent_window)
+        dialog.grab_set()
     
     def start_background_check(self, parent_window):
         """
@@ -148,9 +155,12 @@ class UpdateChecker:
             # Small delay to let app finish loading
             import time
             time.sleep(2)
-            
-            # Run check on main thread (required for GUI operations)
-            parent_window.after(0, lambda: self.prompt_update_if_available(parent_window))
+
+            # Network check happens here in the worker thread; only the
+            # dialog (a GUI operation) is scheduled onto the main thread
+            is_available, download_url, new_version = self.check_for_updates()
+            if is_available and download_url:
+                parent_window.after(0, lambda: self._show_update_dialog(parent_window, download_url, new_version))
         
         thread = threading.Thread(target=check_thread, daemon=True)
         thread.start()

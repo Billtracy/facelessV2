@@ -1,19 +1,16 @@
 import logging
-import os
+import sys
 from pathlib import Path
 from datetime import datetime
 
+from paths import user_data_dir
+
 class AppLogger:
     """Centralized logging system for the Faceless Generator app."""
-    
+
     def __init__(self, log_name="faceless_generator"):
-        # Create logs directory in user's AppData (Windows) or home (Unix)
-        if os.name == 'nt':
-            log_dir = Path(os.environ.get('APPDATA')) / 'FacelessGenerator' / 'logs'
-        else:
-            log_dir = Path.home() / '.faceless_generator' / 'logs'
-        
-        log_dir.mkdir(parents=True, exist_ok=True)
+        # Logs live in the per-user app data folder (see paths.py)
+        log_dir = Path(user_data_dir('logs'))
         
         # Create log file with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -33,15 +30,16 @@ class AppLogger:
                 datefmt='%Y-%m-%d %H:%M:%S'
             )
             file_handler.setFormatter(file_formatter)
-            
-            # Console handler (less verbose)
-            console_handler = logging.StreamHandler()
-            console_handler.setLevel(logging.INFO)
-            console_formatter = logging.Formatter('%(levelname)s: %(message)s')
-            console_handler.setFormatter(console_formatter)
-            
             self.logger.addHandler(file_handler)
-            self.logger.addHandler(console_handler)
+
+            # Console handler (less verbose). In a --windowed PyInstaller
+            # build there is no console: sys.stderr is None, so skip it.
+            if sys.stderr is not None:
+                console_handler = logging.StreamHandler()
+                console_handler.setLevel(logging.INFO)
+                console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+                console_handler.setFormatter(console_formatter)
+                self.logger.addHandler(console_handler)
         
         self.log_file_path = log_file
         self.logger.info(f"Logger initialized. Log file: {log_file}")
