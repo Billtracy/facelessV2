@@ -2,6 +2,7 @@ conformer==0.3.2
 customtkinter==5.2.2
 dicta_onnx==1.0.9
 edge_tts==7.2.7
+google-genai==2.11.0
 groq==1.1.1
 huggingface_hub==0.36.2
 imageio_ffmpeg==0.6.0

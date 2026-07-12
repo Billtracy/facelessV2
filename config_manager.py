@@ -46,7 +46,6 @@ class ConfigManager:
         try:
             with open(self.filename, 'w') as f:
                 json.dump(self.config, f, indent=4)
-            print("Configuration saved.")
         except Exception as e:
             print(f"Error saving config: {e}")
 

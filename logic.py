@@ -6,6 +6,18 @@ import re
 import shutil
 import requests
 import traceback
+import time
+import warnings
+
+# pydub warns loudly at import time about missing ffmpeg/ffprobe on PATH. We
+# supply ffmpeg via imageio_ffmpeg and route audio loads around ffprobe, so
+# these warnings are expected noise -- filter them before importing pydub.
+warnings.filterwarnings(
+    "ignore",
+    message="Couldn't find (ffmpeg or avconv|ffprobe or avprobe).*",
+    category=RuntimeWarning,
+)
+
 from groq import Groq
 import edge_tts
 from pydub import AudioSegment
@@ -16,6 +28,9 @@ from retry_utils import retry_with_backoff
 from resource_path import resource_path, app_dir
 import soundfile as sf
 import movis
+import text_utils
+from blueprints import get_blueprint
+from script_parsing import parse_manual_script, parse_llm_json
 
 try:
     from kokoro_onnx import Kokoro
@@ -26,6 +41,25 @@ if not hasattr(Image, 'ANTIALIAS'):
     Image.ANTIALIAS = Image.LANCZOS
 
 
+# --- Video assembly tuning constants -------------------------------------
+SCENE_PAUSE_MS = 300           # silence appended after each scene's voiceover
+END_BUFFER_MS = 1000           # trailing silence so the video doesn't cut off abruptly
+END_BUFFER_SEC = END_BUFFER_MS / 1000.0
+BG_MUSIC_DUCK_DB = 22          # how far to lower background music under the voice
+KEN_BURNS_ZOOM = 1.12          # Ken Burns zoom factor applied to still images
+SHORTS_SIZE = (1080, 1920)     # (width, height) vertical / Shorts
+LONGFORM_SIZE = (1920, 1080)   # (width, height) horizontal / Long Form
+
+# x264 encode quality for the Movis render. Lower CRF = higher quality/bitrate;
+# 20 keeps the detailed AI imagery crisp on motion for a modest size increase
+# over the libx264 default of 23. 'medium' preset balances speed vs. compression.
+VIDEO_CRF = 20
+VIDEO_PRESET = "medium"
+
+
+class GenerationCancelled(Exception):
+    """Raised at a checkpoint when the user requests cancellation."""
+    pass
 
 
 
@@ -65,13 +99,19 @@ class ViralSafeBot:
             
         # Initialize Kokoro (Lazy load later)
         self.kokoro = None
-            
+
+        # Cooperative cancellation flag (set by request_cancel from the GUI thread)
+        self.cancel_requested = False
+
         # Configure ffmpeg from imageio_ffmpeg
         try:
              import imageio_ffmpeg
              ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
              AudioSegment.converter = ffmpeg_path
              AudioSegment.ffmpeg = ffmpeg_path
+             # Note: imageio_ffmpeg ships ffmpeg but NOT ffprobe, so audio loads
+             # go through safe_load_audio (ffmpeg -> wav). The misleading pydub
+             # "couldn't find ffprobe" warning is filtered at module import.
              self.log(f"[*] FFMPEG found via imageio_ffmpeg: {ffmpeg_path}")
         except Exception as e:
              self.log(f"[!] Warning: Could not locate imageio ffmpeg: {e}")
@@ -96,6 +136,50 @@ class ViralSafeBot:
         self.log(f"[{percent}%] {message}")
         if self.progress_callback:
             self.progress_callback(percent, message)
+
+    def request_cancel(self):
+        """Signal the running generation to stop at the next checkpoint (thread-safe)."""
+        self.cancel_requested = True
+        self.log("[!] Cancellation requested - stopping at next checkpoint...")
+
+    def _check_cancel(self):
+        """Raise GenerationCancelled if a cancel has been requested."""
+        if self.cancel_requested:
+            raise GenerationCancelled("Generation cancelled by user.")
+
+    def _target_size(self):
+        """Return (width, height) for the currently configured video format."""
+        return LONGFORM_SIZE if self.config.get("video_format") == "Long Form" else SHORTS_SIZE
+
+    def _write_caption_file(self, script, video_path):
+        """
+        Write a companion '<video>_caption.txt' next to the rendered video with a
+        ready-to-paste title, description, and hashtags. Best-effort: never fatal.
+        """
+        try:
+            title = script.get("title", "Untitled")
+            topic = script.get("topic", "")
+            first_line = ""
+            scenes = script.get("scenes") or []
+            if scenes:
+                first_line = scenes[0].get("dialogue_text", "").strip()
+
+            hashtags = text_utils.hashtags_from_topic(topic or title)
+            caption_path = os.path.splitext(video_path)[0] + "_caption.txt"
+
+            lines = [title, ""]
+            if first_line:
+                lines += [first_line, ""]
+            lines.append(" ".join(hashtags))
+
+            with open(caption_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines).strip() + "\n")
+
+            self.log(f"[*] Caption file written: {caption_path}")
+            return caption_path
+        except Exception as e:
+            self.log(f"[!] Warning: Could not write caption file: {e}")
+            return None
 
     def generate_script_and_topic(self):
         # CHECK MANUAL MODE FIRST
@@ -144,107 +228,8 @@ class ViralSafeBot:
              word_count_rule = "Strictly 130-150 words MAX total"
              structure_rule = f"List exactly {point_count} punchy, distinct points."
 
-        # 3. BLUEPRINT DICTIONARY (Much cleaner than if/elif chains)
-        blueprints_db = {
-            "Reddit Stories": {
-                "role": 'an engaging voice actor reading a viral, top-tier Reddit "Am I The A**hole", Confession, or Creepypasta.',
-                "task": "Write a gripping, 1st-person story.",
-                "hook": "Start with an insane, dramatic statement or creepy premise.",
-                "cta": "End on a cliffhanger or ask the viewers 'Am I the jerk?'"
-            },
-            "Motivation & Inspiration": {
-                "role": "a hard-hitting motivational speaker and success analyst.",
-                "task": "Write an intense script about discipline or a breakdown of a famous success story.",
-                "hook": "Start with a hard truth (e.g. 'You are wasting your life...')",
-                "cta": "Demand they save the video for when they want to quit."
-            },
-            "Historical Facts": {
-                "role": "a viral history channel exposing hidden truths.",
-                "task": "Share dark, mysterious, or mind-blowing historical facts. STRICT RULE: Use ONLY verified facts. No myths.",
-                "hook": "Start with: 'Here are historical facts they didn't teach you in school...'",
-                "cta": "Tell them to subscribe for more forbidden history."
-            },
-            "Historical Figures": {
-                "role": "a fast-paced biographer of the bizarre.",
-                "task": "Discuss the dark secrets or mind-blowing facts about a specific historical figure.",
-                "hook": "Start with a crazy, lesser-known fact about the person.",
-                "cta": "Ask: 'Who should we cover next? Comment below.'"
-            },
-            "Mythology & Ancient Lore": {
-                "role": "a cinematic storyteller specializing in Mythology.",
-                "task": "Share an epic, terrifying mythological tale or creature from world lore.",
-                "hook": "An epic, mysterious hook about the myth's power or origin.",
-                "cta": "Tell them to subscribe for more mythological lore."
-            },
-            "Stoicism & Daily Philosophy": {
-                "role": "a calm, authoritative guide to Stoicism.",
-                "task": "Share ancient philosophical wisdom applied to modern struggles.",
-                "hook": "A profound quote or a highly relatable modern struggle.",
-                "cta": "Tell them to save this video for when they need clarity."
-            },
-            "\"What If?\" & Cosmic Sci-Fi Scenarios": {
-                "role": "a sci-fi narrator exploring mind-bending paradoxes.",
-                "task": "Describe a terrifying or fascinating cosmic event.",
-                "hook": "Ask: 'What would happen if...' (e.g., you fell into a black hole).",
-                "cta": "Ask: 'Would you survive this? Comment below.'"
-            },
-            "Visual Lore & Design Mysteries": {
-                "role": "an expert on liminal spaces and internet aesthetics.",
-                "task": "Explain a mysterious visual subculture or eerie design concept.",
-                "hook": "Ask: 'Why does this image make you feel nostalgia and dread?'",
-                "cta": "Ask: 'Have you been here in your dreams? Subscribe.'"
-            },
-            "Law": {
-                "role": "an expert legal commentator.",
-                "task": "Tell the story of a crazy lawsuit, a weird law, or a medical malpractice case.",
-                "hook": "Start with: 'Is this completely illegal?' or 'The most insane lawsuit.'",
-                "cta": "Ask: 'Do you agree with the judge? Let me know.'"
-            },
-            "Personal Finance & Wealth": {
-                "role": "a no-nonsense wealth expert.",
-                "task": "Share financial hacks, investing rules, or mistakes keeping people broke.",
-                "hook": "Start with: 'The system is designed to keep you broke. Here is how to escape.'",
-                "cta": "Tell them to save this and subscribe for financial freedom."
-            },
-            "Top 10s & Listicles": {
-                "role": "a fast-paced master of ranking fascinating things.",
-                "task": "Rank a list of incredibly interesting or scary things.",
-                "hook": "Start with: 'Here are the top most insane [topic] that will blow your mind.'",
-                "cta": "Ask: 'Which one was the craziest? Subscribe.'"
-            },
-            "Hollywood Gossips and Lores": {
-                "role": "a conspiratorial Hollywood pop culture historian.",
-                "task": "Reveal a shocking piece of Hollywood lore or a crazy celebrity feud.",
-                "hook": "Start with: 'The craziest Hollywood secret they tried to bury...'",
-                "cta": "Ask: 'Do you believe it? Let me know.'"
-            },
-            "Dark Psychology": {
-                "role": "a dark psychology and human behavior expert.",
-                "task": "Share a powerful dark psychology trick, manipulation tactic (for awareness), or a secret about human behavior.",
-                "hook": "Start with a provocative statement like 'If you want to control any conversation...' or 'The darkest trick to make someone...'",
-                "cta": "Tell them to use this power wisely and subscribe for more psychological secrets."
-            },
-            "Historical Psychology": {
-                "role": "a psychological profiler and historical analyst.",
-                "task": "Provide a deep psychological breakdown of a famous historical figure's motivations or the hidden psychological impact of a major historical event.",
-                "hook": "Start with a question like 'Why did [Figure] really do it?' or 'What if I told you the true cause of [Event] was a simple human psychological flaw?'",
-                "cta": "Ask: 'Which historical mystery should we analyze next? Subscribe for more deep dives.'"
-            },
-            "True Crime Stories": {
-                "role": "a meticulous true crime documentarian.",
-                "task": "Write an intense, suspenseful true crime script about a fascinating unsolved mystery or infamous case.",
-                "hook": "Start with a chilling fact or a terrifying realization about the case.",
-                "cta": "Ask the viewers: 'Who do you think did it? Let me know.'"
-            }
-        }
-
-        # 4. FETCH BLUEPRINT OR FALLBACK TO GENERIC
-        bp = blueprints_db.get(blueprint, {
-            "role": "a viral scriptwriter for a popular YouTube channel.",
-            "task": f"Write an engaging script about {selected_topic}.",
-            "hook": f"A punchy, engaging question relating to {selected_topic}.",
-            "cta": "A strong call to action to subscribe or comment."
-        })
+        # 3-4. FETCH BLUEPRINT OR FALLBACK TO GENERIC (catalog lives in blueprints.py)
+        bp = get_blueprint(blueprint, selected_topic)
 
         # 5. ASSEMBLE THE MASTER PROMPT
         master_prompt = f"""
@@ -315,7 +300,6 @@ class ViralSafeBot:
         return script, error_msg
         
     def _generate_with_groq(self, prompt, selected_topic):
-        # ... (Groq implementation remains the same)
         if not self.client:
             return None, "Groq Client not initialized"
             
@@ -380,84 +364,12 @@ class ViralSafeBot:
             return None, err
 
     def _parse_manual_script(self, raw_text):
-        """
-        Parses manual text where each line is 'Caption | Visual Query'
-        """
-        lines = raw_text.split('\n')
-        scenes = []
-        
-        for i, line in enumerate(lines):
-            line = line.strip()
-            if not line: continue
-            
-            parts = line.split('|')
-            text = parts[0].strip()
-            
-            if len(parts) > 1:
-                visual = parts[1].strip()
-            else:
-                # Provide a fallback visual query if user didn't specify one
-                visual = "dark background abstract"
-                
-            scenes.append({
-                "scene_id": i + 1,
-                "dialogue_text": text,
-                "image_generation_prompt": visual
-            })
-            
-        if not scenes:
-            self.log("[!] Error: Manual script is empty.")
-            return None
-            
-        return {
-            "topic": "Manual Subject",
-            "title": "Manual Video",
-            "scenes": scenes
-        }
+        """Parse manual 'Caption | Visual Query' text (see script_parsing.py)."""
+        return parse_manual_script(raw_text, self.log)
 
     def _parse_llm_json(self, content, selected_topic):
-        try:
-            data = json.loads(content)
-            
-            if not isinstance(data, dict):
-                self.log("[!] JSON is not a dictionary. Forcing empty dict.")
-                data = {}
-                
-            if "topic" not in data: data["topic"] = selected_topic
-            if "title" not in data: data["title"] = f"{selected_topic} - Viral Video"
-            if "scenes" not in data: 
-                if "captions" in data:
-                    data["scenes"] = []
-                    for i, c in enumerate(data["captions"]):
-                        data["scenes"].append({
-                            "scene_id": i + 1,
-                            "dialogue_text": c.get("text", str(c)),
-                            "image_generation_prompt": c.get("visual_query", f"dark {selected_topic} abstract")
-                        })
-                else:
-                    data["scenes"] = []
-            
-            # Normalize scenes to dicts if they are strings (fallback)
-            normalized_scenes = []
-            for i, item in enumerate(data["scenes"]):
-                if isinstance(item, str):
-                    normalized_scenes.append({
-                        "scene_id": i + 1,
-                        "dialogue_text": item,
-                        "image_generation_prompt": f"dark {selected_topic} abstract"
-                    })
-                else:
-                    item["scene_id"] = item.get("scene_id", i + 1)
-                    if "dialogue_text" not in item and "text" in item:
-                        item["dialogue_text"] = item.pop("text")
-                    if "image_generation_prompt" not in item and "visual_query" in item:
-                        item["image_generation_prompt"] = item.pop("visual_query")
-                    normalized_scenes.append(item)
-            data["scenes"] = normalized_scenes
-            return data
-        except Exception as e:
-             self.log(f"[!] JSON Parse Error: {e}")
-             return None
+        """Normalize raw LLM JSON into the script dict (see script_parsing.py)."""
+        return parse_llm_json(content, selected_topic, self.log)
 
 
     def trim_audio_silence(self, audio_segment):
@@ -490,7 +402,6 @@ class ViralSafeBot:
             # 1. Try direct load
             return AudioSegment.from_file(file_path)
         except Exception:
-            # self.log(f"[~] Direct load failed. Trying fallback...") # Verbose
             try:
                 # 2. Fallback: Use FFmpeg CLI -> WAV -> Pydub
                 temp_wav = file_path + ".temp_loader.wav"
@@ -534,10 +445,28 @@ class ViralSafeBot:
         return filename
 
     def _ensure_kokoro_models(self):
-        """Checks for Kokoro models and lowers them if missing"""
+        """Return (onnx_path, voices_path) for Kokoro.
+
+        Prefers model files shipped WITH the app (bundled via PyInstaller, or the
+        repo's models/ folder in dev) so no 80MB first-run download is needed.
+        Only if those are absent does it fall back to downloading into a writable
+        models/ folder next to the executable.
+        """
+        onnx_name = "kokoro-v0_19.int8.onnx"
+        voices_bin_name = "voices.bin"
+
+        # 1. Prefer bundled copies (resource_path -> sys._MEIPASS when frozen).
+        bundled_onnx = resource_path(os.path.join("models", onnx_name))
+        bundled_voices = resource_path(os.path.join("models", voices_bin_name))
+        if os.path.exists(bundled_onnx) and os.path.exists(bundled_voices):
+            self.log("[*] Using bundled Kokoro model (no download needed).")
+            return bundled_onnx, bundled_voices
+
+        # 2. Fall back to downloading into a writable dir next to the app.
+        self.log("[*] Bundled Kokoro model not found; will download if missing.")
         models_dir = os.path.join(app_dir(), "models")
         os.makedirs(models_dir, exist_ok=True)
-        
+
         onnx_path = os.path.join(models_dir, "kokoro-v0_19.int8.onnx")
         voices_path = os.path.join(models_dir, "voices.json") # The raw JSON download
         voices_json_path = voices_path
@@ -599,176 +528,12 @@ class ViralSafeBot:
                     f.write(chunk)
                     
     def _sanitize_for_espeak(self, text):
-        """
-        Aggressively sanitize text to prevent espeak from producing
-        mismatched input/output line counts. This is the root cause of
-        the 'number of lines in input and output must be equal' error.
-        
-        espeak can internally split a single input line into multiple
-        output lines when it encounters certain characters like
-        parentheses, brackets, dashes, slashes, and abbreviations.
-        """
-        # 1. Remove all newlines / carriage returns
-        text = text.replace("\n", " ").replace("\r", " ")
-        
-        # 2. Expand common abbreviations that confuse espeak
-        abbreviations = {
-            "e.g.": "for example",
-            "i.e.": "that is",
-            "etc.": "etcetera",
-            "vs.": "versus",
-            "Mr.": "Mister",
-            "Mrs.": "Missus",
-            "Dr.": "Doctor",
-            "Jr.": "Junior",
-            "Sr.": "Senior",
-            "St.": "Saint",
-            "Prof.": "Professor",
-            "Gen.": "General",
-            "Gov.": "Governor",
-            "Sgt.": "Sergeant",
-            "Corp.": "Corporation",
-            "Inc.": "Incorporated",
-            "Ltd.": "Limited",
-            "approx.": "approximately",
-            "dept.": "department",
-            "est.": "established",
-            "govt.": "government",
-            "ft.": "feet",
-            "lb.": "pounds",
-            "oz.": "ounces",
-        }
-        for abbr, expansion in abbreviations.items():
-            text = text.replace(abbr, expansion)
-            text = text.replace(abbr.upper(), expansion)
-        
-        # 3. Replace characters that cause espeak to split lines
-        #    Parentheses, brackets, braces, slashes -> commas or spaces
-        text = re.sub(r'[(\[{]', ', ', text)
-        text = re.sub(r'[)\]}]', ' ', text)
-        text = re.sub(r'[/\\]', ' ', text)
-        
-        # 3b. Fix mid-word punctuation corruption (e.g. "T!DECISION!'S" -> "TDECISIONS")
-        #     Remove exclamation marks and other symbols that appear INSIDE words
-        text = re.sub(r'(?<=[a-zA-Z])[!?]+(?=[a-zA-Z])', '', text)
-        
-        # 4. Replace all dash variants (em-dash, en-dash, hyphens used as separators)
-        #    Keep single hyphens in compound words (well-known) but remove separating dashes
-        text = re.sub(r'[—–]', ', ', text)           # em-dash and en-dash -> comma
-        text = re.sub(r'\s*-{2,}\s*', ', ', text)    # multiple hyphens -> comma
-        text = re.sub(r'\s+-\s+', ', ', text)         # spaced single dash (separator) -> comma
-        
-        # 5. Remove problematic quotes and special punctuation
-        text = re.sub(r'["""\u201c\u201d\u2018\u2019\'`]', '', text)
-        
-        # 6. Replace colons and semicolons
-        text = text.replace(":", ",").replace(";", ",")
-        
-        # 7. Replace ampersand
-        text = text.replace("&", "and")
-        
-        # 8. Remove hash, asterisk, underscore, tilde, pipe, caret
-        text = re.sub(r'[#*_~|^@<>{}]', ' ', text)
-        
-        # 9. Spell out $ and % symbols
-        text = text.replace("%", " percent")
-        text = text.replace("$", " dollars ")
-        
-        # 10. Spell out standalone numbers that espeak might mishandle
-        #     Years (4-digit numbers)
-        def spell_year(m):
-            num = int(m.group(0))
-            if 1000 <= num <= 2099:
-                # Spell out as a year
-                if num < 2000:
-                    century = num // 100
-                    remainder = num % 100
-                    if remainder == 0:
-                        hundreds = {10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen",
-                                    14: "fourteen", 15: "fifteen", 16: "sixteen", 17: "seventeen",
-                                    18: "eighteen", 19: "nineteen", 20: "twenty"}
-                        return f"{hundreds.get(century, str(century))} hundred"
-                    tens_map = {0: "", 1: "", 2: "twenty", 3: "thirty", 4: "forty", 5: "fifty",
-                                6: "sixty", 7: "seventy", 8: "eighty", 9: "ninety"}
-                    ones_map = {0: "", 1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
-                                6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
-                                11: "eleven", 12: "twelve", 13: "thirteen", 14: "fourteen",
-                                15: "fifteen", 16: "sixteen", 17: "seventeen", 18: "eighteen",
-                                19: "nineteen"}
-                    hundreds = {10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen",
-                                14: "fourteen", 15: "fifteen", 16: "sixteen", 17: "seventeen",
-                                18: "eighteen", 19: "nineteen", 20: "twenty"}
-                    century_word = hundreds.get(century, str(century))
-                    if remainder < 20:
-                        return f"{century_word} {ones_map.get(remainder, str(remainder))}"
-                    else:
-                        tens = tens_map.get(remainder // 10, "")
-                        ones = ones_map.get(remainder % 10, "")
-                        rem_word = f"{tens} {ones}".strip() if ones else tens
-                        return f"{century_word} {rem_word}"
-                elif num == 2000:
-                    return "two thousand"
-                elif num < 2010:
-                    ones_map = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
-                                6: "six", 7: "seven", 8: "eight", 9: "nine"}
-                    return f"two thousand and {ones_map.get(num - 2000, str(num - 2000))}"
-                else:
-                    remainder = num - 2000
-                    tens_map = {1: "ten", 2: "twenty", 3: "thirty", 4: "forty", 5: "fifty",
-                                6: "sixty", 7: "seventy", 8: "eighty", 9: "ninety"}
-                    ones_map = {0: "", 1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
-                                6: "six", 7: "seven", 8: "eight", 9: "nine",
-                                10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen",
-                                14: "fourteen", 15: "fifteen", 16: "sixteen", 17: "seventeen",
-                                18: "eighteen", 19: "nineteen"}
-                    if remainder < 20:
-                        return f"twenty {ones_map.get(remainder, str(remainder))}"
-                    else:
-                        tens = tens_map.get(remainder // 10, "")
-                        ones = ones_map.get(remainder % 10, "")
-                        rem_word = f"{tens} {ones}".strip() if ones else tens
-                        return f"twenty {rem_word}"
-            return m.group(0)
-        
-        text = re.sub(r'\b\d{4}\b', spell_year, text)
-        
-        # 11. Replace number ranges with "to" (e.g. "5-7" -> "5 to 7")
-        text = re.sub(r'(\d+)\s*-\s*(\d+)', r'\1 to \2', text)
-        
-        # 12. Collapse multiple spaces and commas
-        text = re.sub(r',\s*,+', ',', text)          # multiple commas
-        text = re.sub(r'\s+', ' ', text)              # multiple spaces
-        text = re.sub(r'\s*,\s*', ', ', text)         # normalize comma spacing
-        
-        # 13. Remove leading/trailing punctuation artifacts
-        text = text.strip(' ,;')
-        
-        return text
+        """Sanitize text for espeak TTS (see text_utils.sanitize_for_espeak)."""
+        return text_utils.sanitize_for_espeak(text)
 
     def _sanitize_for_display(self, text):
-        """
-        Sanitize dialogue_text for visual display on screen.
-        Removes corrupted punctuation, brackets, and other artifacts
-        that the AI may have injected into the script.
-        """
-        # Remove brackets and parentheses
-        text = re.sub(r'[\[\](){}]', '', text)
-        
-        # Remove exclamation/question marks that appear INSIDE words (e.g. T!DECISION!'S)
-        text = re.sub(r'(?<=[a-zA-Z])[!?]+(?=[a-zA-Z])', '', text)
-        
-        # Remove stray asterisks, underscores, pipes, carets
-        text = re.sub(r'[*_|^~#]', '', text)
-        
-        # Normalize quotes - remove fancy quotes and stray single quotes not part of contractions
-        text = re.sub(r'["""\u201c\u201d]', '', text)
-        # Keep apostrophes in contractions (don't, it's) but remove stray ones
-        text = re.sub(r"(?<![a-zA-Z])'|'(?![a-zA-Z])", '', text)
-        
-        # Collapse multiple spaces
-        text = re.sub(r'\s+', ' ', text).strip()
-        
-        return text
+        """Sanitize dialogue_text for on-screen display (see text_utils.sanitize_for_display)."""
+        return text_utils.sanitize_for_display(text)
 
     async def _generate_kokoro_tts(self, text, voice_name, output_file):
         """Generates audio using local Kokoro-82M"""
@@ -1121,6 +886,9 @@ class ViralSafeBot:
         word_metrics = []
         for i, word in enumerate(words):
             word = word.upper() # Fix: measure uppercase since we draw uppercase
+            # Drop trailing/leading sentence punctuation for a clean viral caption
+            # look (upstream chunking already used the punctuation as a break hint).
+            word = text_utils.strip_caption_punct(word)
             use_font = active_font if i == active_index else font
             bbox = draw.textbbox((0, 0), word, font=use_font)
             ww = draw.textlength(word, font=use_font) # Use true advance width
@@ -1289,8 +1057,11 @@ class ViralSafeBot:
             # Check file size, if 0 byte (placeholder), return silent
             if os.path.getsize(path) < 100:
                 return AudioSegment.silent(duration=500)
-            return AudioSegment.from_file(path)
-        except:
+            # Route through safe_load_audio so it survives a missing system ffprobe
+            # (imageio_ffmpeg ships ffmpeg only, not ffprobe).
+            return self.safe_load_audio(path)
+        except Exception as e:
+            self.log(f"[!] Warning: Could not load SFX '{name}': {e}")
             return None
 
     def inject_sfx(self, audio_segment, text, previous_text=""):
@@ -1353,13 +1124,27 @@ class ViralSafeBot:
         all_visual_clips = []
         total_duration = 0.0
         
-        self.log(f"[*] Assembling {len(script['scenes'])} scenes with synced audios/visuals...")
+        num_scenes = len(script['scenes'])
+        self.log(f"[*] Assembling {num_scenes} scenes with synced audios/visuals...")
 
-        # We assume bg_paths corresponds somewhat to scenes indices
-        # If lengths mismatch (e.g. some downloads failed), we wrap around using modulo
-        
+        # bg_paths ideally corresponds 1:1 to scenes. If some downloads failed the
+        # lists differ in length and we wrap around with modulo -- warn when that
+        # happens so a silently-reused/mismatched background is visible in the logs.
+        if len(bg_paths) != num_scenes:
+            self.log(
+                f"[!] Warning: {len(bg_paths)} background(s) for {num_scenes} scene(s); "
+                f"some scenes will reuse backgrounds (wrap-around)."
+            )
+
         for i, scene_obj in enumerate(script['scenes']):
-            text = scene_obj.get('dialogue_text', '')            
+            self._check_cancel()
+            # Per-scene progress across the assembly band (65% -> 82%)
+            if num_scenes:
+                self.report_progress(
+                    65 + int(17 * i / num_scenes),
+                    f"Assembling scene {i + 1} of {num_scenes}..."
+                )
+            text = scene_obj.get('dialogue_text', '')
             # --- AUDIO PROCESSING ---
             audio_file = audio_files[i]
             # Safe load
@@ -1367,23 +1152,21 @@ class ViralSafeBot:
             # Trim silence
             seg = self.trim_audio_silence(raw_seg)
             # Add pause
-            seg = seg + AudioSegment.silent(duration=300) 
-            
+            seg = seg + AudioSegment.silent(duration=SCENE_PAUSE_MS)
+
             # --- SFX INJECTION ---
             prev_text = script['scenes'][i-1]['dialogue_text'] if i > 0 else ""
             seg = self.inject_sfx(seg, text, prev_text)
-            
+
             dur_sec = len(seg) / 1000.0
-            
+
             # --- VISUAL PROCESSING (SYNCED) ---
             # Get specific background for this scene
             bg_file = bg_paths[i % len(bg_paths)]
-            
+
             try:
-                is_long_form = self.config.get("video_format") == "Long Form"
-                target_w = 1920 if is_long_form else 1080
-                target_h = 1080 if is_long_form else 1920
-                
+                target_w, target_h = self._target_size()
+
                 if bg_file.lower().endswith(('.png', '.jpg', '.jpeg')):
                      # PREMIUM FEATURE: Ken Burns Effect on AI Images
                      from PIL import Image
@@ -1456,29 +1239,31 @@ class ViralSafeBot:
             total_duration += dur_sec
 
         # --- FINAL ASSEMBLY ---
-        
-        # Add 1s buffer to audio
-        audio_segments.append(AudioSegment.silent(duration=1000))
-        total_duration_video = total_duration + 1.0 # 1s buffer
-        
+
+        # Add trailing buffer to audio so the video doesn't cut off abruptly
+        audio_segments.append(AudioSegment.silent(duration=END_BUFFER_MS))
+        total_duration_video = total_duration + END_BUFFER_SEC
+
         # Extend the last visual clip to cover the buffer (prevents black screen at end)
         for clip_data in reversed(all_visual_clips):
             if clip_data["type"] != "text":
-                clip_data["duration"] += 1.0  # Extend last background by 1s
+                clip_data["duration"] += END_BUFFER_SEC  # Extend last background over buffer
                 break
             
         final_audio_path = f"{self.output_folder}/final_audio.mp3"
         full_voice = sum(audio_segments)
         
         # --- BACKGROUND MUSIC ---
-        bg_music_path = os.path.join("assets", "audio", "bg-music.mp3")
+        # Use resource_path so this resolves inside a PyInstaller bundle (assets
+        # are extracted to sys._MEIPASS), consistent with fonts/SFX loading.
+        bg_music_path = os.path.join(resource_path("assets"), "audio", "bg-music.mp3")
         if os.path.exists(bg_music_path):
             try:
                 self.log("[*] Adding background music...")
-                bg_track = AudioSegment.from_file(bg_music_path)
-                
-                # Lower volume significantly so it doesn't overpower voice (-22 dB)
-                bg_track = bg_track - 22
+                bg_track = self.safe_load_audio(bg_music_path)
+
+                # Lower volume significantly so it doesn't overpower the voice
+                bg_track = bg_track - BG_MUSIC_DUCK_DB
                 
                 # Loop bg music if it's shorter than the voice track
                 voice_len_ms = len(full_voice)
@@ -1496,12 +1281,11 @@ class ViralSafeBot:
                 
         full_voice.export(final_audio_path, format="mp3")
         
+        self._check_cancel()
         self.report_progress(85, "Rendering final video composition with Movis...")
-        
-        is_long_form = self.config.get("video_format") == "Long Form"
-        target_w = 1920 if is_long_form else 1080
-        target_h = 1080 if is_long_form else 1920
-        
+
+        target_w, target_h = self._target_size()
+
         comp = movis.layer.Composition(size=(target_w, target_h), duration=total_duration_video)
         
         zoom_in = True
@@ -1522,7 +1306,7 @@ class ViralSafeBot:
             
             if clip_data["type"] == "image":
                 # Ken Burns Effect alternating zoom in / zoom out
-                zoom_factor = 1.12
+                zoom_factor = KEN_BURNS_ZOOM
                 # Note: Movis interprets keyframes based on absolute composition time
                 motion = comp_item.scale.enable_motion()
                 if zoom_in:
@@ -1538,29 +1322,51 @@ class ViralSafeBot:
                 s = max(ratio_w, ratio_h)
                 comp_item.scale = (s, s)
                 
-        safe_title = re.sub(r'[^\w\-_\. ]', '_', script['title'])
+        safe_title = text_utils.safe_filename(script['title'])
         temp_vid = f"{self.output_folder}/{safe_title}_temp_movis.mp4"
         out_file = f"{self.output_folder}/{safe_title}_V2.0.mp4"
         
-        # Render silent video directly with FFmpeg via Movis (blazing fast compared to MoviePy)
-        comp.write_video(temp_vid)
+        # Render silent video directly with FFmpeg via Movis (blazing fast compared to MoviePy).
+        # Pass explicit x264 quality so detailed AI imagery stays crisp on motion.
+        comp.write_video(
+            temp_vid,
+            output_params=["-crf", str(VIDEO_CRF), "-preset", VIDEO_PRESET]
+        )
         
         # Mux audio with FFmpeg
         self.report_progress(95, "Muxing Audio with FFmpeg...")
         import subprocess
         import imageio_ffmpeg
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        mux_ok = False
         try:
-             subprocess.run([
+             proc = subprocess.run([
                  ffmpeg_exe, "-y", "-i", temp_vid, "-i", final_audio_path,
                  "-c:v", "copy", "-c:a", "aac", out_file
-             ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-             self.log(f"[!] Muxing failed.")
-             
+             ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+             if proc.returncode != 0:
+                 err = proc.stderr.decode("utf-8", "ignore").strip().splitlines()
+                 detail = err[-1] if err else f"exit code {proc.returncode}"
+                 raise RuntimeError(detail)
+             mux_ok = True
+        except Exception as e:
+             self.log(f"[!] Muxing failed: {e}")
+
+        # Verify the final file actually exists and is non-empty before claiming success.
+        if not (mux_ok and os.path.exists(out_file) and os.path.getsize(out_file) > 0):
+             # Keep the silent temp video around so the run isn't a total loss / is debuggable.
+             self.log(f"[!] Final muxed video was not produced. Silent render kept at: {temp_vid}")
+             raise RuntimeError(
+                 f"Failed to produce final video (audio muxing did not complete). "
+                 f"Silent video preserved at: {temp_vid}"
+             )
+
         self.log(f"\n[SUCCESS] Video Saved: {out_file}")
-        
-        # Robust Temp Cleanup 
+
+        # Write a ready-to-paste caption/hashtags file next to the video
+        self._write_caption_file(script, out_file)
+
+        # Robust Temp Cleanup (only reached once the final video exists)
         try:
              import gc
              gc.collect()
@@ -1568,35 +1374,49 @@ class ViralSafeBot:
                  os.remove(temp_vid)
              shutil.rmtree(self.temp_folder, ignore_errors=True)
              os.makedirs(self.temp_folder, exist_ok=True)
-        except: pass
+        except Exception as cleanup_err:
+             self.log(f"[!] Warning: temp cleanup failed: {cleanup_err}")
+
+    def _format_elapsed(self, seconds):
+        """Format a duration in seconds (see text_utils.format_elapsed)."""
+        return text_utils.format_elapsed(seconds)
 
     async def run_full_process_async(self):
         """Async wrapper for the full process"""
+        start_time = time.time()
         try:
             self.report_progress(0, "Initializing and checking API keys...")
 
+            self._check_cancel()
             self.report_progress(10, "Generating Viral Script with AI...")
             script, error = self.generate_script_and_topic()
             if not script:
                  return False, f"Failed to generate script: {error}"
 
             self.log(f"Topic: {script.get('topic', 'Unknown')}")
-            
+
             # PARALLEL DOWNLOADS for PER-CAPTION VISUALS
+            self._check_cancel()
             bg_paths = await self.download_backgrounds_for_scenes(script['scenes'])
-            
+
             if not bg_paths:
                  return False, "Failed to download backgrounds (Pexels API Error or no results)."
 
             # Assemble video
             await self.assemble_video(script, bg_paths)
-            return True, "Video generated successfully!"
-            
+            elapsed = self._format_elapsed(time.time() - start_time)
+            return True, f"Video generated successfully! (Time taken: {elapsed})"
+
+        except GenerationCancelled as e:
+            self.log(f"[!] {e}")
+            return False, "Generation cancelled by user."
         except Exception as e:
             err_details = traceback.format_exc()
-            self.log(f"[CRITICAL ERROR]\n{err_details}") 
+            self.log(f"[CRITICAL ERROR]\n{err_details}")
             return False, f"Critical Logic Error:\n{err_details}"
         finally:
+            elapsed = self._format_elapsed(time.time() - start_time)
+            self.log(f"[*] Time taken: {elapsed}")
             # Final safety cleanup
             try:
                 import gc
@@ -1608,20 +1428,11 @@ class ViralSafeBot:
                 self.log(f"[!] Failed to cleanup temp folder: {cleanup_error}")
 
     def run_full_process(self):
-        """Entry point for threads"""
-        # Create a new loop for this thread if needed
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-        return loop.run_until_complete(self.run_full_process_async())
-        
+        """Entry point for worker threads. Runs the async pipeline to completion."""
+        # asyncio.run() creates, drives, and cleanly closes a fresh event loop for
+        # this thread -- the modern replacement for the deprecated get_event_loop().
+        return asyncio.run(self.run_full_process_async())
+
+
 if __name__ == "__main__":
-    # --- Quick Test Mode ---
     print("Run via gui.py or main.py for full features.")
-    # from config_manager import ConfigManager
-    # cfg = ConfigManager().config
-    # bot = ViralSafeBot(cfg)
-    # bot.run_full_process()

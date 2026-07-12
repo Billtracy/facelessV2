@@ -1,6 +1,7 @@
 import customtkinter as ctk
 import threading
 import os
+import re
 import time
 from config_manager import ConfigManager
 from logic import ViralSafeBot
@@ -31,8 +32,13 @@ class FacelessApp(ctk.CTk):
         
         self.current_frame = None
         
-        # ROUTING LOGIC (Bypassed License Check)
-        if not self._check_credits_exist():
+        # ROUTING LOGIC
+        # Require an activated license before anything else. Once a key has been
+        # validated by the server it is stored, so returning users skip straight
+        # to credentials/dashboard.
+        if not self.config.get("license_key", "").strip():
+            self.show_license_page()
+        elif not self._check_credits_exist():
             self.show_credentials_page()
         else:
             self.show_main_dashboard()
@@ -157,7 +163,10 @@ class FacelessApp(ctk.CTk):
              if customer_name:
                  self.config_manager.set("customer_name", customer_name)
              self.logger.info(f"License validated for: {customer_name or 'Customer'}")
-             self.show_credentials_page()
+             if self._check_credits_exist():
+                 self.show_main_dashboard()
+             else:
+                 self.show_credentials_page()
         else:
              self.lbl_lic_error.configure(text=msg)
              self.logger.warning(f"License validation failed: {msg}")
@@ -438,6 +447,13 @@ class FacelessApp(ctk.CTk):
         self.lbl_percent = ctk.CTkLabel(wrapper, text="0%", font=("Arial", 14), text_color="gray")
         self.lbl_percent.pack(pady=(0, 20))
         
+        # Cancel button: signals the bot to stop at the next checkpoint
+        self.btn_cancel = ctk.CTkButton(
+            wrapper, text="Cancel", command=self.cancel_generation,
+            height=32, width=160, fg_color="#8B1E1E", hover_color="#A52A2A"
+        )
+        self.btn_cancel.pack(pady=(15, 0))
+
         # Console Log (Initially Hidden)
         self.btn_toggle_log = ctk.CTkButton(wrapper, text="Show Logs", command=self.toggle_logs, height=30, fg_color="gray")
         self.btn_toggle_log.pack(pady=(20, 5))
@@ -466,13 +482,25 @@ class FacelessApp(ctk.CTk):
          # Optional: Add log entry for major steps
          self._safe_console_update(f"[PROGRESS] {percent}% - {message}")
 
+    def cancel_generation(self):
+        """Signal the running bot to stop; disable the button so it can't be spammed."""
+        bot = getattr(self, "bot", None)
+        if bot is not None:
+            bot.request_cancel()
+        self.logger.info("User requested cancellation")
+        try:
+            self.btn_cancel.configure(text="Cancelling...", state="disabled")
+        except Exception:
+            pass
+
     def run_process(self):
         """Background thread for video generation"""
         try:
             self.logger.info("Starting video generation process")
             # Pass progress callback
             bot = ViralSafeBot(self.config, status_callback=self.update_console, progress_callback=self.update_progress_display, logger=self.logger)
-            
+            self.bot = bot  # exposed so the Cancel button can signal it
+
             # Check for Manual Override
             if self.manual_mode.get():
                 raw_script = self.input_script_manual.get("1.0", "end-1c").strip()
@@ -492,7 +520,7 @@ class FacelessApp(ctk.CTk):
             time.sleep(1)
             
             # Switch to Result
-            self.after(0, lambda: self.show_result_page(success, msg if not success else ""))
+            self.after(0, lambda: self.show_result_page(success, msg))
             
         except Exception as e:
             error_message = str(e)
@@ -519,26 +547,39 @@ class FacelessApp(ctk.CTk):
             self.console_box.configure(state="disabled")
 
     # --- STEP 5: SUCCESS PAGE ---
-    def show_result_page(self, success, error_msg=""):
+    def show_result_page(self, success, msg=""):
         self.clear_view()
         self.current_frame = ctk.CTkFrame(self)
         self.current_frame.pack(fill="both", expand=True)
-        
+
         wrapper = ctk.CTkFrame(self.current_frame, fg_color="transparent")
         wrapper.place(relx=0.5, rely=0.5, anchor="center")
-        
+
         if success:
+            # Pull "(Time taken: ...)" out of the success message, if present
+            time_match = re.search(r"\(Time taken: ([^)]+)\)", msg or "")
+            time_taken = time_match.group(1) if time_match else None
+
             ctk.CTkLabel(wrapper, text="✅", font=("Arial", 60)).pack(pady=10)
             ctk.CTkLabel(wrapper, text="VIDEO GENERATED SUCCESSFULLY!", font=("Arial", 24, "bold"), text_color="green").pack(pady=10)
             ctk.CTkLabel(wrapper, text=f"Saved to: {self.config.get('output_folder')}", font=("Arial", 14), text_color="gray").pack(pady=5)
-            
+            if time_taken:
+                ctk.CTkLabel(wrapper, text=f"Time taken: {time_taken}", font=("Arial", 14), text_color="gray").pack(pady=5)
+
             ctk.CTkButton(wrapper, text="GENERATE ANOTHER", font=("Arial", 16, "bold"), height=50, width=300, command=self.show_main_dashboard).pack(pady=30)
             ctk.CTkButton(wrapper, text="Open Folder", font=("Arial", 14), width=300, fg_color="gray", command=self.open_output_folder).pack(pady=5)
+        elif "cancel" in (msg or "").lower():
+            # User-initiated cancellation: neutral state, not a failure
+            ctk.CTkLabel(wrapper, text="🛑", font=("Arial", 60)).pack(pady=10)
+            ctk.CTkLabel(wrapper, text="GENERATION CANCELLED", font=("Arial", 24, "bold"), text_color="orange").pack(pady=10)
+            ctk.CTkLabel(wrapper, text="You stopped this run.", font=("Arial", 12), text_color="gray").pack(pady=10)
+
+            ctk.CTkButton(wrapper, text="BACK TO DASHBOARD", font=("Arial", 16, "bold"), height=50, width=300, command=self.show_main_dashboard).pack(pady=30)
         else:
             ctk.CTkLabel(wrapper, text="❌", font=("Arial", 60)).pack(pady=10)
             ctk.CTkLabel(wrapper, text="GENERATION FAILED", font=("Arial", 24, "bold"), text_color="red").pack(pady=10)
-            ctk.CTkLabel(wrapper, text=error_msg[:200] + "...", font=("Arial", 12), text_color="gray").pack(pady=10)
-            
+            ctk.CTkLabel(wrapper, text=(msg or "")[:200] + "...", font=("Arial", 12), text_color="gray").pack(pady=10)
+
             ctk.CTkButton(wrapper, text="TRY AGAIN", font=("Arial", 16, "bold"), height=50, width=300, command=self.show_main_dashboard).pack(pady=30)
 
     def open_output_folder(self):
@@ -613,7 +654,6 @@ class FacelessApp(ctk.CTk):
             "last_voice_kokoro": self.opt_voice.get(),
             "last_font": self.opt_font.get(),
             "tts_provider": "kokoro",
-            # "google_creds_path": ... removed
         }
         self.config_manager.save_config(updated_cfg)
         self.config = self.config_manager.config

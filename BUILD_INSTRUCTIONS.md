@@ -91,21 +91,26 @@ If you have `app_icon.png`:
 pyinstaller FacelessGenerator.spec --noconfirm
 ```
 
-**OR copy and paste this command (equivalent):**
+**OR copy and paste this command (verified working — see note below):**
 
 ```bash
-pyinstaller --noconfirm --onedir --windowed --name "FacelessGenerator" --add-data "settings_template.json;." --add-data "assets;assets" --collect-all customtkinter --collect-all groq --collect-all edge_tts --collect-all movis --collect-all kokoro_onnx --copy-metadata imageio --copy-metadata requests --copy-metadata packaging --hidden-import "pydub" --hidden-import "requests" --hidden-import "PIL" --hidden-import "PIL.ImageDraw" --hidden-import "PIL.ImageFont" --hidden-import "numpy" --hidden-import "soundfile" --hidden-import "tkinter" --hidden-import "tkinter.ttk" --hidden-import "tkinter.font" --hidden-import "google.genai" --icon "icon.ico" main.py
+pyinstaller --noconfirm --onedir --windowed --name "FacelessGenerator" --add-data "settings_template.json;." --add-data "assets;assets" --add-data "models/kokoro-v0_19.int8.onnx;models" --add-data "models/voices.bin;models" --collect-all customtkinter --collect-all groq --collect-all edge_tts --collect-all movis --collect-all kokoro_onnx --collect-all imageio_ffmpeg --collect-all "google.genai" --collect-all language_tags --collect-all pykakasi --collect-all espeakng_loader --collect-all phonemizer --copy-metadata imageio --copy-metadata requests --copy-metadata packaging --hidden-import "pydub" --hidden-import "requests" --hidden-import "PIL" --hidden-import "PIL.ImageDraw" --hidden-import "PIL.ImageFont" --hidden-import "numpy" --hidden-import "soundfile" --hidden-import "tkinter" --hidden-import "tkinter.ttk" --hidden-import "tkinter.font" --icon "icon.ico" main.py
 ```
 
 **If you don't have `icon.ico`, remove** `--icon "icon.ico"` from the command.
 
-**What's new:**
+**What's new / important:**
 - `--add-data "assets;assets"` - **CRITICAL:** Bundles fonts, SFX, and background music.
+- `--add-data "models/kokoro-v0_19.int8.onnx;models" --add-data "models/voices.bin;models"` - Bundles the Kokoro TTS model (~98MB total) so customers get NO 80MB first-run download. The app prefers the bundled model and only downloads if these are missing. Requires `models/kokoro-v0_19.int8.onnx` and `models/voices.bin` to exist in the project (run the app once, or convert `voices.json` -> `voices.bin`).
+- `--collect-all imageio_ffmpeg` - **CRITICAL:** Bundles the ffmpeg binary the app needs for all audio/video work.
 - `--collect-all movis` - Required for the video rendering engine.
 - `--collect-all kokoro_onnx` - Required for the premium local TTS engine.
+- `--collect-all espeakng_loader --collect-all phonemizer --collect-all language_tags --collect-all pykakasi` - **CRITICAL:** Kokoro's phonemization stack loads data files / a native espeak-ng library at runtime. Without these the EXE crashes on startup with `No such file or directory: ...language_tags\data\json\index.json` (and TTS fails later).
+- `--collect-all "google.genai"` - Required for the Gemini AI provider (install first: `pip install google-genai`). If you do NOT want Gemini, drop this flag.
 - `--hidden-import "soundfile"` - Required for processing audio samples.
-- `--hidden-import "google.genai"` - Required for Gemini AI provider.
 - `--copy-metadata packaging` - Fixes version resolution for core libraries.
+
+> Note: use `--collect-all "google.genai"` (not `--hidden-import`); the hidden-import form fails the build if the package's data/submodules aren't collected.
 
 **What this does:**
 - `--onedir` - Creates a folder with all dependencies.
