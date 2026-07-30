@@ -106,12 +106,20 @@ class ViralSafeBot:
         # Cooperative cancellation flag (set by request_cancel from the GUI thread)
         self.cancel_requested = False
 
+        # Populated after a successful render; the GUI's success page reads
+        # these to offer the direct YouTube upload.
+        self.final_video_path = None
+        self.final_caption_path = None
+        self.final_script = None
+
         # Configure ffmpeg from imageio_ffmpeg
+        self.ffmpeg_exe = "ffmpeg"  # PATH fallback if imageio_ffmpeg is unavailable
         try:
              import imageio_ffmpeg
              ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
              AudioSegment.converter = ffmpeg_path
              AudioSegment.ffmpeg = ffmpeg_path
+             self.ffmpeg_exe = ffmpeg_path
              # Note: imageio_ffmpeg ships ffmpeg but NOT ffprobe, so audio loads
              # go through safe_load_audio (ffmpeg -> wav). The misleading pydub
              # "couldn't find ffprobe" warning is filtered at module import.
@@ -432,20 +440,7 @@ class ViralSafeBot:
         try:
             return AudioSegment.from_file(file_path)
         except Exception:
-            try:
-                # 2. Fallback: Use FFmpeg CLI -> WAV -> Pydub
-                temp_wav = file_path + ".temp_loader.wav"
-                
-                import subprocess
-                import imageio_ffmpeg
-                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-                # Run ffmpeg to extract audio as wav
-                subprocess.run(
-                    [ffmpeg_exe, "-y", "-i", file_path, "-acodec", "pcm_s16le", "-ar", "44100", temp_wav],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True
-                )
+            pass
 
         # 3. Fallback: bundled FFmpeg -> WAV -> pydub
         temp_wav = file_path + ".temp_loader.wav"
@@ -1305,10 +1300,26 @@ class ViralSafeBot:
         full_voice = sum(audio_segments)
         
         # --- BACKGROUND MUSIC ---
-        # Use resource_path so this resolves inside a PyInstaller bundle (assets
-        # are extracted to sys._MEIPASS), consistent with fonts/SFX loading.
-        bg_music_path = os.path.join(resource_path("assets"), "audio", "bg-music.mp3")
-        if os.path.exists(bg_music_path):
+        # Config "bg_music_path": "" -> bundled default track, "none" -> music
+        # disabled, anything else -> user-supplied audio file.
+        default_music = os.path.join(resource_path("assets"), "audio", "bg-music.mp3")
+        bg_choice = (self.config.get("bg_music_path") or "").strip()
+        if bg_choice.lower() == "none":
+            bg_music_path = None
+            self.log("[*] Background music disabled by user.")
+        elif bg_choice:
+            bg_music_path = bg_choice
+            if not os.path.exists(bg_music_path):
+                self.log(f"[!] Custom music file missing: {bg_music_path}. Using bundled track.")
+                bg_music_path = default_music
+            else:
+                self.log(f"[*] Using custom background music: {os.path.basename(bg_music_path)}")
+        else:
+            # Use resource_path so this resolves inside a PyInstaller bundle (assets
+            # are extracted to sys._MEIPASS), consistent with fonts/SFX loading.
+            bg_music_path = default_music
+
+        if bg_music_path and os.path.exists(bg_music_path):
             try:
                 self.log("[*] Adding background music...")
                 bg_track = self.safe_load_audio(bg_music_path)
@@ -1415,7 +1426,12 @@ class ViralSafeBot:
         self.log(f"\n[SUCCESS] Video Saved: {out_file}")
 
         # Write a ready-to-paste caption/hashtags file next to the video
-        self._write_caption_file(script, out_file)
+        caption_path = self._write_caption_file(script, out_file)
+
+        # Remember the outputs for the GUI (YouTube upload button etc.)
+        self.final_video_path = out_file
+        self.final_caption_path = caption_path
+        self.final_script = script
 
         # Robust Temp Cleanup (only reached once the final video exists)
         try:
@@ -1432,17 +1448,24 @@ class ViralSafeBot:
         """Format a duration in seconds (see text_utils.format_elapsed)."""
         return text_utils.format_elapsed(seconds)
 
-    async def run_full_process_async(self):
-        """Async wrapper for the full process"""
+    async def run_full_process_async(self, script=None):
+        """Async wrapper for the full process.
+
+        If `script` is provided (already generated and approved/edited by the
+        user on the preview page), the LLM generation step is skipped.
+        """
         start_time = time.time()
         try:
             self.report_progress(0, "Initializing and checking API keys...")
 
             self._check_cancel()
-            self.report_progress(10, "Generating Viral Script with AI...")
-            script, error = self.generate_script_and_topic()
-            if not script:
-                 return False, f"Failed to generate script: {error}"
+            if script is None:
+                self.report_progress(10, "Generating Viral Script with AI...")
+                script, error = self.generate_script_and_topic()
+                if not script:
+                     return False, f"Failed to generate script: {error}"
+            else:
+                self.report_progress(10, "Rendering approved script...")
 
             self.log(f"Topic: {script.get('topic', 'Unknown')}")
 
@@ -1478,11 +1501,11 @@ class ViralSafeBot:
             except Exception as cleanup_error:
                 self.log(f"[!] Failed to cleanup temp folder: {cleanup_error}")
 
-    def run_full_process(self):
+    def run_full_process(self, script=None):
         """Entry point for worker threads. Runs the async pipeline to completion."""
         # asyncio.run() creates, drives, and cleanly closes a fresh event loop for
         # this thread -- the modern replacement for the deprecated get_event_loop().
-        return asyncio.run(self.run_full_process_async())
+        return asyncio.run(self.run_full_process_async(script))
 
 
 if __name__ == "__main__":

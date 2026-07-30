@@ -58,3 +58,20 @@ The app uses Pollinations.ai to generate unique cinematic images for your scenes
 **Status**: **No API Key Required.**
 - **Kokoro (Default)**: Runs locally on your computer for high-quality, human-like narration. No internet required for voice generation once the model is downloaded.
 - **Edge TTS (Fallback)**: Used automatically if Kokoro encounters a complex sentence. High-quality Microsoft cloud voices.
+
+---
+
+## 5. Direct YouTube Upload (Optional)
+
+**Cost**: Free | Lets the app upload finished videos straight to your channel.
+
+Because uploads go to **your** YouTube channel, Google requires you to create your own (free) credentials:
+
+1. **Create a project**: Go to [https://console.cloud.google.com/](https://console.cloud.google.com/) and create a new project (any name, e.g. "FacelessUploader").
+2. **Enable the API**: In "APIs & Services" → "Library", search for **YouTube Data API v3** and click **Enable**.
+3. **Configure consent screen**: In "APIs & Services" → "OAuth consent screen", choose **External**, fill in the app name and your email, and add your own Google account as a **Test user**.
+4. **Create credentials**: In "APIs & Services" → "Credentials", click **Create Credentials → OAuth client ID**, choose **Desktop app**, then **Download JSON** (this is your `client_secret.json`).
+5. **Enter in App**: In Settings, browse to the downloaded `client_secret.json` and click **Connect YouTube Account**. A browser window opens — sign in with the channel's Google account and approve.
+6. **Upload**: After each video is generated, click **⬆ Upload to YouTube** on the success screen. Title, description, and hashtags are pre-filled from the script.
+
+> **Important**: While your Google Cloud project is unverified (the normal state for personal use), YouTube locks uploaded videos to **Private**. You can flip them to Public manually in YouTube Studio, or submit your project for verification to remove the limit. Quota note: uploads cost 1600 quota units each; the free daily quota (10,000 units) allows ~6 uploads per day.

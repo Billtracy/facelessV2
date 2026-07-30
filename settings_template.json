@@ -13,6 +13,8 @@
     "last_voice": "en-US-ChristopherNeural",
     "last_voice_kokoro": "af",
     "last_font": "Anton-Regular",
+    "bg_music_path": "",
+    "yt_client_secret_path": "",
     "video_format": "Shorts",
     "tts_provider": "kokoro",
     "prompt_template": "",

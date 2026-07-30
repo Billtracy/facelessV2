@@ -10,6 +10,15 @@ from logger import AppLogger
 from version import CURRENT_VERSION, APP_NAME
 from updater import UpdateChecker
 from paths import resource_path
+import sound_preview
+import voice_catalog
+import youtube_uploader
+import webbrowser
+
+# One-click YouTube upload is feature-complete but held back pending Google API
+# project verification. Flip this to True to re-enable the Settings connect
+# fields and the upload button on the success screen.
+YOUTUBE_UPLOAD_ENABLED = False
 
 class FacelessApp(ctk.CTk):
     def __init__(self, config_manager):
@@ -53,6 +62,10 @@ class FacelessApp(ctk.CTk):
         return bool(c.get("groq_api_key") or c.get("gemini_api_key"))
 
     def clear_view(self):
+        try:
+            sound_preview.stop()  # don't let previews bleed into the next page
+        except Exception:
+            pass
         if self.current_frame:
             self.current_frame.pack_forget()
             self.current_frame.destroy()
@@ -85,29 +98,98 @@ class FacelessApp(ctk.CTk):
         # with an internal Edge TTS fallback already in logic.py), so this
         # no longer branches on a provider widget.
         self.frame_google_creds.pack_forget()
-        # Kokoro Voices (Verified from voices.bin)
-        voices = [
-            "af",           # Default Female (Heart)
-            "af_bella",
-            "af_nicole",
-            "af_sarah",
-            "af_sky",
-            "am_adam",
-            "am_michael",
-            "bf_emma",
-            "bf_isabella",
-            "bm_george",
-            "bm_lewis"
-        ]
-        self.opt_voice.configure(values=voices)
+        # Friendly display names for the verified Kokoro voices (voice_catalog.py)
+        self.opt_voice.configure(values=voice_catalog.display_names())
 
         # Auto-correct old saved voice "af_heart" -> "af"
         saved = self.config.get("last_voice_kokoro", "af")
         if saved == "af_heart": saved = "af"
-        if saved not in voices: saved = "af"
 
-        self.opt_voice.set(saved)
+        # Unknown IDs (custom typed) pass through and stay editable
+        self.opt_voice.set(voice_catalog.to_display(saved))
 
+    # --- SOUND PREVIEW & MUSIC SELECTION ---
+    def on_music_change(self, choice):
+        if choice == "Custom File...":
+            f = ctk.filedialog.askopenfilename(filetypes=[
+                ("Audio Files", "*.mp3 *.wav *.m4a *.ogg *.flac"),
+                ("All Files", "*.*")
+            ])
+            if f:
+                self.custom_music_path = f
+            elif not self.custom_music_path:
+                # Dialog cancelled and nothing previously chosen: revert
+                self.var_music.set("Default (Bundled)")
+        self._refresh_music_label()
+
+    def _refresh_music_label(self):
+        if self.var_music.get() == "Custom File..." and self.custom_music_path:
+            self.lbl_music_file.configure(text=f"♪ {os.path.basename(self.custom_music_path)}")
+        else:
+            self.lbl_music_file.configure(text="")
+
+    def _resolve_music_path(self):
+        """Current music selection -> file path (None = music disabled)."""
+        choice = self.var_music.get()
+        if choice == "None (Silent)":
+            return None
+        if choice == "Custom File...":
+            return self.custom_music_path or None
+        return resource_path("assets", "audio", "bg-music.mp3")
+
+    def _music_config_value(self):
+        """Current music selection -> config value ('' = default, 'none' = off)."""
+        choice = self.var_music.get()
+        if choice == "None (Silent)":
+            return "none"
+        if choice == "Custom File...":
+            return self.custom_music_path or ""
+        return ""
+
+    def preview_music(self):
+        path = self._resolve_music_path()
+        if not path:
+            self._show_validation_error("No Music Selected", "Background music is set to None (Silent).")
+            return
+        if not os.path.exists(path):
+            self._show_validation_error("File Missing", f"Music file not found:\n{path}")
+            return
+        self.logger.info(f"Previewing music: {path}")
+        threading.Thread(target=self._music_preview_thread, args=(path,), daemon=True).start()
+
+    def _music_preview_thread(self, path):
+        try:
+            sound_preview.play(path)
+        except Exception as e:
+            error_message = str(e)
+            self.logger.error(f"Music preview failed: {error_message}")
+            self.after(0, lambda: self._show_validation_error("Preview Failed", error_message))
+
+    def preview_voice(self):
+        voice_id = voice_catalog.to_voice_id(self.opt_voice.get().strip())
+        if not voice_id:
+            return
+        self.btn_voice_preview.configure(state="disabled", text="…")
+        self.logger.info(f"Previewing voice: {voice_id}")
+        threading.Thread(target=self._voice_preview_thread, args=(voice_id,), daemon=True).start()
+
+    def _voice_preview_thread(self, voice_id):
+        try:
+            sample = sound_preview.render_voice_sample(voice_id)
+            sound_preview.play(sample)
+        except Exception as e:
+            error_message = str(e)
+            self.logger.error(f"Voice preview failed: {error_message}")
+            self.after(0, lambda: self._show_validation_error(
+                "Voice Preview Failed", f"Could not preview '{voice_id}':\n{error_message}"))
+        finally:
+            self.after(0, self._reset_voice_preview_btn)
+
+    def _reset_voice_preview_btn(self):
+        try:
+            self.btn_voice_preview.configure(state="normal", text="▶")
+        except Exception:
+            pass  # user navigated away; the button no longer exists
 
     # --- STEP 1: LICENSE PAGE ---
     def show_license_page(self):
@@ -251,9 +333,41 @@ class FacelessApp(ctk.CTk):
         self.entry_pexels_cred.pack(anchor="w", pady=(0, 10))
         self.entry_pexels_cred.insert(0, self.config.get("pexels_api_key", ""))
 
+        # YouTube Upload (optional)
+        ctk.CTkLabel(form, text="YouTube Upload (Optional):", font=("Arial", 14, "bold")).pack(anchor="w", pady=(10, 5))
+        if YOUTUBE_UPLOAD_ENABLED:
+            ctk.CTkLabel(form,
+                         text="To enable one-click uploads: Google Cloud Console → enable 'YouTube Data API v3' → "
+                              "create OAuth credentials (type: Desktop app) → download client_secret.json and select it here.",
+                         text_color="gray", font=("Arial", 11), wraplength=760, justify="left").pack(anchor="w")
+
+            row_yt = ctk.CTkFrame(form, fg_color="transparent")
+            row_yt.pack(fill="x", anchor="w", pady=(5, 0))
+            self.entry_yt_secret = ctk.CTkEntry(row_yt, width=450, placeholder_text="Path to client_secret.json")
+            self.entry_yt_secret.pack(side="left", padx=(0, 10))
+            self.entry_yt_secret.insert(0, self.config.get("yt_client_secret_path", ""))
+            ctk.CTkButton(row_yt, text="Browse", width=100, command=self.browse_yt_secret).pack(side="left")
+
+            row_yt2 = ctk.CTkFrame(form, fg_color="transparent")
+            row_yt2.pack(fill="x", anchor="w", pady=(5, 10))
+            self.lbl_yt_status = ctk.CTkLabel(row_yt2, text="", font=("Arial", 12))
+            self.lbl_yt_status.pack(side="left", padx=(0, 15))
+            self.btn_yt_connect = ctk.CTkButton(row_yt2, text="Connect YouTube Account", width=200,
+                                                fg_color="#CC0000", hover_color="#990000",
+                                                command=self.connect_youtube)
+            self.btn_yt_connect.pack(side="left", padx=(0, 10))
+            ctk.CTkButton(row_yt2, text="Disconnect", width=100, fg_color="gray",
+                          command=self.disconnect_youtube).pack(side="left")
+            self._refresh_yt_status()
+        else:
+            ctk.CTkLabel(form,
+                         text="🔜 One-click YouTube upload is coming soon. For now, export your "
+                              "video and upload it through YouTube Studio.",
+                         text_color="gray", font=("Arial", 11), wraplength=760, justify="left").pack(anchor="w", pady=(0, 10))
+
         # Initial Visibility Update
         self.update_settings_visibility()
-        
+
         # Output Folder
         ctk.CTkLabel(form, text="Export Folder:", font=("Arial", 14, "bold")).pack(anchor="w", pady=(10, 5))
         
@@ -289,6 +403,62 @@ class FacelessApp(ctk.CTk):
              self.entry_out_cred.delete(0, "end")
              self.entry_out_cred.insert(0, f)
 
+    # --- YOUTUBE ACCOUNT LINKING ---
+    def browse_yt_secret(self):
+        f = ctk.filedialog.askopenfilename(filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")])
+        if f:
+            self.entry_yt_secret.delete(0, "end")
+            self.entry_yt_secret.insert(0, f)
+
+    def _refresh_yt_status(self):
+        try:
+            if youtube_uploader.is_connected():
+                self.lbl_yt_status.configure(text="● Connected", text_color="green")
+            else:
+                self.lbl_yt_status.configure(text="● Not connected", text_color="gray")
+        except Exception:
+            pass  # settings page may have been closed
+
+    def connect_youtube(self):
+        secret_path = self.entry_yt_secret.get().strip()
+        if not secret_path or not os.path.exists(secret_path):
+            self._show_validation_error("Missing client_secret.json",
+                                       "Select your client_secret.json file first.\n"
+                                       "See the instructions above the field.")
+            return
+        # Persist the path so the uploader finds it later
+        self.config_manager.set("yt_client_secret_path", secret_path)
+        self.config = self.config_manager.config
+
+        self.btn_yt_connect.configure(state="disabled", text="Waiting for browser sign-in...")
+        self.lbl_yt_status.configure(text="● Sign in via the browser window...", text_color="orange")
+        threading.Thread(target=self._yt_connect_thread, args=(secret_path,), daemon=True).start()
+
+    def _yt_connect_thread(self, secret_path):
+        try:
+            uploader = youtube_uploader.YouTubeUploader(secret_path, logger=self.logger)
+            uploader.connect()
+            self.logger.info("YouTube account connected")
+            self.after(0, lambda: self._yt_connect_done(None))
+        except Exception as e:
+            error_message = str(e)
+            self.logger.error(f"YouTube connect failed: {error_message}")
+            self.after(0, lambda: self._yt_connect_done(error_message))
+
+    def _yt_connect_done(self, error):
+        try:
+            self.btn_yt_connect.configure(state="normal", text="Connect YouTube Account")
+            self._refresh_yt_status()
+        except Exception:
+            return  # user left the settings page mid-flow
+        if error:
+            self._show_validation_error("YouTube Connection Failed", error)
+
+    def disconnect_youtube(self):
+        youtube_uploader.disconnect()
+        self.logger.info("YouTube account disconnected")
+        self._refresh_yt_status()
+
     def save_credentials(self, go_to_main):
         new_conf = {
              "llm_provider": "gemini" if "Gemini" in self.combo_llm.get() else "groq",
@@ -296,6 +466,9 @@ class FacelessApp(ctk.CTk):
              "gemini_api_key": self.entry_gemini_cred.get().strip(),
              "pollen_api_key": self.entry_pollen_cred.get().strip(),
              "pexels_api_key": self.entry_pexels_cred.get().strip(),
+             "yt_client_secret_path": (self.entry_yt_secret.get().strip()
+                                       if getattr(self, "entry_yt_secret", None) is not None
+                                       else self.config.get("yt_client_secret_path", "")),
              "output_folder": self.entry_out_cred.get().strip()
         }
         self.config_manager.save_config(new_conf)
@@ -402,27 +575,53 @@ class FacelessApp(ctk.CTk):
         # Keep frame helper to avoid errors but don't pack stuff inside
 
         
-        # Voice (Editable Combobox for Custom Voice ID)
+        # Voice (Editable Combobox for Custom Voice ID) + Preview button
         ctk.CTkLabel(right_col, text="Narrator Voice:", anchor="w").pack(fill="x", padx=15, pady=(15,0))
-        self.opt_voice = ctk.CTkComboBox(right_col, values=[
-            "en-US-ChristopherNeural", 
-            "en-US-GuyNeural", 
-            "en-US-EricNeural", 
-            "en-GB-RyanNeural", 
-            "en-US-JennyNeural",
-            "en-AU-NatashaNeural"
-        ])
-        self.opt_voice.pack(fill="x", padx=15, pady=5)
-        
+        row_voice = ctk.CTkFrame(right_col, fg_color="transparent")
+        row_voice.pack(fill="x", padx=15, pady=5)
+        self.opt_voice = ctk.CTkComboBox(row_voice, values=voice_catalog.display_names())
+        self.opt_voice.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.btn_voice_preview = ctk.CTkButton(row_voice, text="▶", width=36, command=self.preview_voice)
+        self.btn_voice_preview.pack(side="right")
+
         # Init state
         self.update_voice_options() # Refresh UI state
 
-        
+
         # Font
         ctk.CTkLabel(right_col, text="Caption Font:", anchor="w").pack(fill="x", padx=15, pady=(15,0))
         self.opt_font = ctk.CTkOptionMenu(right_col, values=["Anton-Regular", "Arial-Bold", "Impact", "Verdana-Bold", "Courier-Bold", "Times-Bold"])
         self.opt_font.pack(fill="x", padx=15, pady=5)
         self.opt_font.set(self.config.get("last_font", "Anton-Regular"))
+
+        # Background Music (Default / None / user-supplied file) + Preview
+        ctk.CTkLabel(right_col, text="Background Music:", anchor="w").pack(fill="x", padx=15, pady=(15, 0))
+        row_music = ctk.CTkFrame(right_col, fg_color="transparent")
+        row_music.pack(fill="x", padx=15, pady=5)
+
+        self.custom_music_path = ""
+        saved_music = (self.config.get("bg_music_path") or "").strip()
+        if saved_music.lower() == "none":
+            initial_music = "None (Silent)"
+        elif saved_music:
+            initial_music = "Custom File..."
+            self.custom_music_path = saved_music
+        else:
+            initial_music = "Default (Bundled)"
+
+        self.var_music = ctk.StringVar(value=initial_music)
+        self.opt_music = ctk.CTkOptionMenu(
+            row_music, values=["Default (Bundled)", "None (Silent)", "Custom File..."],
+            variable=self.var_music, command=self.on_music_change
+        )
+        self.opt_music.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.btn_music_preview = ctk.CTkButton(row_music, text="▶", width=36, command=self.preview_music)
+        self.btn_music_preview.pack(side="left", padx=(0, 5))
+        ctk.CTkButton(row_music, text="■", width=36, fg_color="gray", command=sound_preview.stop).pack(side="right")
+
+        self.lbl_music_file = ctk.CTkLabel(right_col, text="", text_color="gray", font=("Arial", 10), anchor="w")
+        self.lbl_music_file.pack(fill="x", padx=15)
+        self._refresh_music_label()
 
         # Start background update check after dashboard is loaded
         self.update_checker.start_background_check(self)
@@ -435,6 +634,141 @@ class FacelessApp(ctk.CTk):
         else:
             self.miniframe_manual.pack_forget()
             self.miniframe_auto.pack(fill="both", expand=True)
+
+    # --- STEP 3.5: SCRIPT PREVIEW / EDIT ---
+    def start_script_generation(self):
+        """Generate (or regenerate) the AI script, then show the preview page."""
+        self.bot = None
+        self.show_progress_page()
+        self.update_progress_display(10, "Generating Viral Script with AI...")
+        threading.Thread(target=self._run_script_generation_thread, daemon=True).start()
+
+    def _run_script_generation_thread(self):
+        """Background thread: script generation only (no download/render)."""
+        try:
+            bot = ViralSafeBot(self.config, status_callback=self.update_console,
+                               progress_callback=self.update_progress_display, logger=self.logger)
+            self.bot = bot  # exposed so the Cancel button can signal it
+
+            script, error = bot.generate_script_and_topic()
+
+            if bot.cancel_requested:
+                self.after(0, lambda: self.show_result_page(False, "Generation cancelled by user."))
+                return
+
+            if script:
+                self.logger.info(f"Script generated with {len(script.get('scenes', []))} scenes, awaiting review")
+                self.after(0, lambda: self.show_script_preview_page(script))
+            else:
+                self.logger.error(f"Script generation failed: {error}")
+                self.after(0, lambda: self.show_result_page(False, f"Failed to generate script: {error}"))
+        except Exception as e:
+            error_message = str(e)
+            self.logger.exception("Critical error during script generation")
+            self.after(0, lambda: self.show_result_page(False, error_message))
+
+    def show_script_preview_page(self, script):
+        """Review & edit the AI script before spending minutes on the render."""
+        self.clear_view()
+        self.preview_script = script
+        self.current_frame = ctk.CTkFrame(self)
+        self.current_frame.pack(fill="both", expand=True)
+
+        # Header
+        header = ctk.CTkFrame(self.current_frame, fg_color="transparent")
+        header.pack(fill="x", padx=30, pady=(20, 5))
+        ctk.CTkLabel(header, text="REVIEW SCRIPT", font=("Arial", 22, "bold"), text_color="cyan").pack(side="left")
+        ctk.CTkLabel(header, text="Edit any scene below, then render.", text_color="gray").pack(side="left", padx=15)
+
+        # Action buttons (packed bottom-first so they never scroll off screen)
+        btn_row = ctk.CTkFrame(self.current_frame, fg_color="transparent")
+        btn_row.pack(side="bottom", fill="x", padx=30, pady=20)
+        ctk.CTkButton(btn_row, text="Back", width=100, fg_color="gray",
+                      command=self.show_main_dashboard).pack(side="left")
+        ctk.CTkButton(btn_row, text="🔄 Regenerate Script", width=180, fg_color="#B8860B", hover_color="#8B6508",
+                      command=self.start_script_generation).pack(side="left", padx=10)
+        ctk.CTkButton(btn_row, text="▶ RENDER VIDEO", font=("Arial", 16, "bold"), height=50,
+                      fg_color="green", hover_color="darkgreen",
+                      command=self.start_render_from_preview).pack(side="right", fill="x", expand=True, padx=(10, 0))
+
+        # Title
+        title_row = ctk.CTkFrame(self.current_frame, fg_color="transparent")
+        title_row.pack(fill="x", padx=30, pady=5)
+        ctk.CTkLabel(title_row, text="Title:", font=("Arial", 13, "bold"), width=50, anchor="w").pack(side="left")
+        self.entry_preview_title = ctk.CTkEntry(title_row)
+        self.entry_preview_title.pack(side="left", fill="x", expand=True)
+        self.entry_preview_title.insert(0, script.get("title", "Untitled"))
+
+        # Scenes
+        scroll = ctk.CTkScrollableFrame(self.current_frame)
+        scroll.pack(fill="both", expand=True, padx=30, pady=10)
+
+        self.preview_scene_rows = []
+        for i, scene in enumerate(script.get("scenes", [])):
+            row = {}
+            frame = ctk.CTkFrame(scroll)
+            frame.pack(fill="x", pady=6)
+
+            head = ctk.CTkFrame(frame, fg_color="transparent")
+            head.pack(fill="x", padx=10, pady=(8, 0))
+            ctk.CTkLabel(head, text=f"Scene {i + 1}", font=("Arial", 13, "bold"),
+                         text_color="orange").pack(side="left")
+            ctk.CTkButton(head, text="✕ Remove", width=80, height=24, fg_color="#8B1E1E", hover_color="#A52A2A",
+                          command=lambda r=row: self._delete_preview_scene(r)).pack(side="right")
+
+            ctk.CTkLabel(frame, text="Dialogue (spoken + captions):", font=("Arial", 11),
+                         text_color="gray", anchor="w").pack(fill="x", padx=10)
+            dlg = ctk.CTkTextbox(frame, height=60, wrap="word")
+            dlg.pack(fill="x", padx=10, pady=(0, 5))
+            dlg.insert("1.0", scene.get("dialogue_text", ""))
+
+            ctk.CTkLabel(frame, text="Visual prompt (AI image):", font=("Arial", 11),
+                         text_color="gray", anchor="w").pack(fill="x", padx=10)
+            prompt = ctk.CTkEntry(frame)
+            prompt.pack(fill="x", padx=10, pady=(0, 10))
+            prompt.insert(0, scene.get("image_generation_prompt", ""))
+
+            row.update({"frame": frame, "dialogue": dlg, "prompt": prompt, "deleted": False})
+            self.preview_scene_rows.append(row)
+
+    def _delete_preview_scene(self, row):
+        remaining = [r for r in self.preview_scene_rows if not r["deleted"]]
+        if len(remaining) <= 1:
+            self._show_validation_error("Cannot Remove", "The script needs at least one scene.")
+            return
+        row["deleted"] = True
+        row["frame"].destroy()
+
+    def _collect_edited_script(self):
+        """Build the final script dict from the (possibly edited) preview widgets."""
+        scenes = []
+        for row in self.preview_scene_rows:
+            if row["deleted"]:
+                continue
+            text = row["dialogue"].get("1.0", "end-1c").strip()
+            prompt = row["prompt"].get().strip()
+            if not text:
+                continue  # blank dialogue = scene removed by clearing it
+            scenes.append({
+                "scene_id": len(scenes) + 1,
+                "dialogue_text": text,
+                "image_generation_prompt": prompt or "dark abstract"
+            })
+        title = self.entry_preview_title.get().strip() or self.preview_script.get("title", "Untitled")
+        return {
+            "topic": self.preview_script.get("topic", title),
+            "title": title,
+            "scenes": scenes
+        }
+
+    def start_render_from_preview(self):
+        script = self._collect_edited_script()
+        if not script["scenes"]:
+            self._show_validation_error("Empty Script", "At least one scene with dialogue is required.")
+            return
+        self.logger.info(f"Rendering approved script with {len(script['scenes'])} scenes")
+        self.show_progress_page()
+        threading.Thread(target=self.run_process, args=(script,), daemon=True).start()
 
     # --- STEP 4: PROGRESS OVERLAY ---
     def show_progress_page(self):
@@ -508,23 +842,19 @@ class FacelessApp(ctk.CTk):
         except Exception:
             pass
 
-    def run_process(self):
-        """Background thread for video generation"""
+    def run_process(self, script=None):
+        """Background thread for video generation.
+
+        script=None runs the full pipeline (manual mode or legacy path);
+        a script dict skips LLM generation and renders the approved script.
+        """
         try:
             self.logger.info("Starting video generation process")
             # Pass progress callback
             bot = ViralSafeBot(self.config, status_callback=self.update_console, progress_callback=self.update_progress_display, logger=self.logger)
             self.bot = bot  # exposed so the Cancel button can signal it
 
-            # Check for Manual Override
-            if self.manual_mode.get():
-                raw_script = self.input_script_manual.get("1.0", "end-1c").strip()
-                self.config["manual_script_content"] = raw_script
-                self.config["use_manual_script"] = True
-            else:
-                self.config["use_manual_script"] = False
-                
-            success, msg = bot.run_full_process()
+            success, msg = bot.run_full_process(script)
             
             if success:
                 self.logger.info("Video generation completed successfully")
@@ -583,6 +913,18 @@ class FacelessApp(ctk.CTk):
 
             ctk.CTkButton(wrapper, text="GENERATE ANOTHER", font=("Arial", 16, "bold"), height=50, width=300, command=self.show_main_dashboard).pack(pady=30)
             ctk.CTkButton(wrapper, text="Open Folder", font=("Arial", 14), width=300, fg_color="gray", command=self.open_output_folder).pack(pady=5)
+
+            # Direct YouTube upload (needs the rendered file remembered by the bot)
+            video_path = getattr(getattr(self, "bot", None), "final_video_path", None)
+            if video_path and os.path.exists(video_path):
+                if YOUTUBE_UPLOAD_ENABLED:
+                    ctk.CTkButton(wrapper, text="⬆ Upload to YouTube", font=("Arial", 14, "bold"), width=300,
+                                  fg_color="#CC0000", hover_color="#990000",
+                                  command=self.open_upload_dialog).pack(pady=5)
+                else:
+                    ctk.CTkButton(wrapper, text="⬆ Upload to YouTube (Coming Soon)", font=("Arial", 14, "bold"),
+                                  width=300, fg_color="gray", hover_color="gray",
+                                  state="disabled").pack(pady=5)
         elif "cancel" in (msg or "").lower():
             # User-initiated cancellation: neutral state, not a failure
             ctk.CTkLabel(wrapper, text="🛑", font=("Arial", 60)).pack(pady=10)
@@ -596,6 +938,157 @@ class FacelessApp(ctk.CTk):
             ctk.CTkLabel(wrapper, text=(msg or "")[:200] + "...", font=("Arial", 12), text_color="gray").pack(pady=10)
 
             ctk.CTkButton(wrapper, text="TRY AGAIN", font=("Arial", 16, "bold"), height=50, width=300, command=self.show_main_dashboard).pack(pady=30)
+
+    # --- YOUTUBE UPLOAD DIALOG ---
+    def open_upload_dialog(self):
+        if not YOUTUBE_UPLOAD_ENABLED:
+            self._show_validation_error("Coming Soon",
+                                       "One-click YouTube upload is coming soon.\n"
+                                       "For now, export your video and upload it through YouTube Studio.")
+            return
+        bot = getattr(self, "bot", None)
+        video_path = getattr(bot, "final_video_path", None) if bot else None
+        if not video_path or not os.path.exists(video_path):
+            self._show_validation_error("No Video", "The rendered video file could not be found.")
+            return
+
+        secret_path = (self.config.get("yt_client_secret_path") or "").strip()
+        if not secret_path or not os.path.exists(secret_path):
+            self._show_validation_error("YouTube Not Configured",
+                                       "Add your Google client_secret.json in Settings first.\n\n"
+                                       "Google Cloud Console → enable 'YouTube Data API v3' → "
+                                       "OAuth credentials (Desktop app) → download the JSON.")
+            return
+
+        script = getattr(bot, "final_script", None) or {}
+        default_title = script.get("title") or os.path.splitext(os.path.basename(video_path))[0]
+
+        # Prefill description from the ready-to-paste caption file
+        default_desc = ""
+        caption_path = getattr(bot, "final_caption_path", None)
+        if caption_path and os.path.exists(caption_path):
+            try:
+                with open(caption_path, "r", encoding="utf-8") as f:
+                    default_desc = f.read().strip()
+            except Exception:
+                pass
+
+        win = ctk.CTkToplevel(self)
+        win.title("Upload to YouTube")
+        win.geometry("640x600")
+        win.transient(self)
+        win.grab_set()
+
+        frame = ctk.CTkFrame(win)
+        frame.pack(fill="both", expand=True, padx=15, pady=15)
+
+        ctk.CTkLabel(frame, text="⬆ Upload to YouTube", font=("Arial", 20, "bold")).pack(pady=(5, 2))
+        ctk.CTkLabel(frame, text=f"File: {os.path.basename(video_path)}",
+                     text_color="gray", font=("Arial", 11)).pack()
+
+        ctk.CTkLabel(frame, text="Title:", anchor="w").pack(fill="x", padx=10, pady=(10, 0))
+        entry_title = ctk.CTkEntry(frame)
+        entry_title.pack(fill="x", padx=10)
+        entry_title.insert(0, default_title[:100])
+
+        ctk.CTkLabel(frame, text="Description:", anchor="w").pack(fill="x", padx=10, pady=(10, 0))
+        box_desc = ctk.CTkTextbox(frame, height=130, wrap="word")
+        box_desc.pack(fill="x", padx=10)
+        if default_desc:
+            box_desc.insert("1.0", default_desc)
+
+        ctk.CTkLabel(frame, text="Privacy:", anchor="w").pack(fill="x", padx=10, pady=(10, 0))
+        var_privacy = ctk.StringVar(value="private")
+        ctk.CTkSegmentedButton(frame, values=["private", "unlisted", "public"],
+                               variable=var_privacy).pack(fill="x", padx=10)
+        ctk.CTkLabel(frame,
+                     text="Note: Google locks uploads from unverified API projects to Private "
+                          "until your Cloud project passes verification.",
+                     text_color="gray", font=("Arial", 10), wraplength=580,
+                     justify="left").pack(fill="x", padx=10, pady=(3, 0))
+
+        prog = ctk.CTkProgressBar(frame, mode="determinate")
+        prog.pack(fill="x", padx=10, pady=(15, 3))
+        prog.set(0)
+        lbl_status = ctk.CTkLabel(frame, text="Ready to upload.", text_color="gray", font=("Arial", 12))
+        lbl_status.pack()
+
+        btn_upload = ctk.CTkButton(frame, text="START UPLOAD", font=("Arial", 15, "bold"), height=45,
+                                   fg_color="#CC0000", hover_color="#990000")
+        btn_upload.pack(fill="x", padx=10, pady=(10, 5))
+
+        widgets = {"win": win, "prog": prog, "status": lbl_status, "btn": btn_upload}
+
+        def start_upload():
+            title = entry_title.get().strip()
+            if not title:
+                lbl_status.configure(text="Title is required.", text_color="red")
+                return
+            desc = box_desc.get("1.0", "end-1c").strip()
+            btn_upload.configure(state="disabled", text="Uploading...")
+            lbl_status.configure(text="Starting...", text_color="gray")
+            threading.Thread(
+                target=self._yt_upload_thread,
+                args=(secret_path, video_path, title, desc, var_privacy.get(), widgets),
+                daemon=True
+            ).start()
+
+        btn_upload.configure(command=start_upload)
+
+    def _yt_upload_status(self, widgets, text, color="gray"):
+        def apply():
+            try:
+                widgets["status"].configure(text=text, text_color=color)
+            except Exception:
+                pass  # dialog closed
+        self.after(0, apply)
+
+    def _yt_upload_thread(self, secret_path, video_path, title, desc, privacy, widgets):
+        try:
+            uploader = youtube_uploader.YouTubeUploader(secret_path, logger=self.logger)
+
+            if not uploader.is_connected():
+                self._yt_upload_status(widgets, "Sign in to Google in the browser window...", "orange")
+                uploader.connect()
+
+            self._yt_upload_status(widgets, "Uploading video...")
+
+            def on_progress(percent):
+                def apply():
+                    try:
+                        widgets["prog"].set(percent / 100.0)
+                        widgets["status"].configure(text=f"Uploading... {percent}%")
+                    except Exception:
+                        pass
+                self.after(0, apply)
+
+            video_id = uploader.upload(video_path, title, desc,
+                                       privacy=privacy, progress_callback=on_progress)
+            url = f"https://youtu.be/{video_id}"
+            self.logger.info(f"YouTube upload complete: {url}")
+
+            def show_success():
+                try:
+                    widgets["prog"].set(1.0)
+                    widgets["status"].configure(text=f"✅ Uploaded! {url}", text_color="green")
+                    widgets["btn"].configure(text="OPEN ON YOUTUBE", state="normal",
+                                             fg_color="green", hover_color="darkgreen",
+                                             command=lambda: webbrowser.open(url))
+                except Exception:
+                    pass
+            self.after(0, show_success)
+
+        except Exception as e:
+            error_message = str(e)
+            self.logger.error(f"YouTube upload failed: {error_message}")
+
+            def show_error():
+                try:
+                    widgets["status"].configure(text=f"❌ {error_message[:160]}", text_color="red")
+                    widgets["btn"].configure(state="normal", text="RETRY UPLOAD")
+                except Exception:
+                    pass
+            self.after(0, show_error)
 
     def open_output_folder(self):
         path = self.config.get("output_folder")
@@ -657,27 +1150,45 @@ class FacelessApp(ctk.CTk):
                                        f"Current length: {len(custom_prompt)}")
             return
         
+        # 4. Validate custom background music (if selected)
+        if self.var_music.get() == "Custom File..." and not (
+                self.custom_music_path and os.path.exists(self.custom_music_path)):
+            self._show_validation_error("Music File Missing",
+                                       "Custom background music is selected but the file "
+                                       "was not found.\nPick the file again or switch to "
+                                       "Default/None.")
+            return
+
         # === VALIDATION PASSED ===
         self.logger.info("All validations passed, starting generation")
-        
+
         # Save current options
         updated_cfg = {
             "last_blueprint": self.var_blueprint.get(),
             "last_topic": self.input_topic.get().strip(),
             "video_format": self.var_video_format.get(),
             "prompt_template": custom_prompt,
-            "last_voice_kokoro": self.opt_voice.get(),
+            "last_voice_kokoro": voice_catalog.to_voice_id(self.opt_voice.get().strip()),
             "last_font": self.opt_font.get(),
             "tts_provider": "kokoro",
+            "bg_music_path": self._music_config_value(),
         }
         self.config_manager.save_config(updated_cfg)
         self.config = self.config_manager.config
-        
-        # Switch to Progress
-        self.show_progress_page()
-        
-        # Start generation thread (daemon so it closes with app)
-        threading.Thread(target=self.run_process, daemon=True).start()
+
+        if self.manual_mode.get():
+            # Manual scripts were written by the user, so no preview step.
+            # Capture the textbox NOW: switching pages destroys the dashboard
+            # widgets, so the worker thread can't read them later.
+            self.config["manual_script_content"] = self.input_script_manual.get("1.0", "end-1c").strip()
+            self.config["use_manual_script"] = True
+            self.show_progress_page()
+            threading.Thread(target=self.run_process, daemon=True).start()
+        else:
+            # Auto mode: generate the script first, let the user review/edit
+            # it on the preview page, then render.
+            self.config["use_manual_script"] = False
+            self.start_script_generation()
     
     def _show_validation_error(self, title, message):
         """Shows a validation error dialog"""
